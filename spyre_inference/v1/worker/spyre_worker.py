@@ -19,6 +19,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.cpu_worker import CPUWorker
+import vllm.v1.worker.cpu_worker as cpu_worker_module
 
 from spyre_inference.custom_ops import register_all
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
@@ -54,15 +55,20 @@ class TorchSpyreWorker(CPUWorker):
         # layers will be swapped out with the custom implementations for spyre.
         register_all()
 
-    def init_device(self) -> None:
-        # Call the upstream init_device function for the environment setup
-        super().init_device()
-
-        # Construct Spyre model runner with torch.device("spyre")
-        self.model_runner = TorchSpyreModelRunner(
+    def init_device(self) -> None:                                
+        # Patch the CPUModelRunner with the TorchSpyreModelRunner
+        original = cpu_worker_module.CPUModelRunner
+        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(
             self.vllm_config,
             torch.device("spyre"),
         )
+        try:
+            # We will invoke the upstream init_device method with the
+            # CPUModelRunner patched. This will ensure that everything for the CPUWorker is setup,
+            # but the spyre-specific model runner is instantiated instead.
+            super().init_device()
+        finally:
+            cpu_worker_module.CPUModelRunner = original
 
     def compile_or_warm_up_model(self) -> float:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420
