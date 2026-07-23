@@ -11,7 +11,7 @@ description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "torch-spyre",
+    "torch-spyre; platform_machine != 's390x'",
     "vllm>=0.25.1,<0.26",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
@@ -89,6 +89,15 @@ override-dependencies = [
     "requests>=2.32.4",
 
 ]
+#exclude-dependencies = [
+    # skip torch-spyre, which is expected to be pre-installed
+    #"torch-spyre; platform_machine == 's390x'",
+
+    # skip these vllm dependency packages on s390x due to build errors
+    #mistra_common[image]; platform_machine == 's390x',
+    #opencv-python-headless; platform_machine == 's390x',
+    #opentelemetry-exporter-otlp; platform_machine == 's390x',
+#]
 build-constraint-dependencies = ["torch==2.11.0"]
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
