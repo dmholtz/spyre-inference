@@ -11,7 +11,7 @@ description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "torch-spyre",
+    "torch-spyre; platform_machine != 's390x'", # expected to be pre-installed on s390x
     "vllm>=0.25.1,<0.26",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
