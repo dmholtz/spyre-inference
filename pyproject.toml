@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm>=0.26.0,<0.27",
+    "vllm==git+https://github.com/vllm-project/vllm.git@v0.26.1rc0",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
