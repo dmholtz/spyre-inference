@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.26.1rc0",
+    "vllm",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -96,7 +96,7 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "-
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.26.1rc0" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "30c708894aee9bd78827919f15401cd08b2e46c9" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
