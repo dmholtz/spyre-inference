@@ -1,6 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-FileCopyrightText: Copyright The Spyre-Inference Authors.
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from typing import Callable, Literal
 
@@ -17,12 +27,14 @@ TorchProfilerActivityMap = {
     "PrivateUse1": torch.profiler.ProfilerActivity.PrivateUse1,
 }
 
+
 class TorchSpyreProfilerWrapper(TorchProfilerWrapper):
     """This subclass patches the TorchProfilerWrapper to enable third-party profiling
     for torch-spyre using Pytorch's PrivateUse1 activity / device namespace.
-    
+
     This is a temporary workaround until PR https://github.com/vllm-project/vllm/pull/50977
     lands in vLLM and spyre-inference pulls in the latest vLLM version with the PR merged."""
+
     def __init__(
         self,
         profiler_config: ProfilerConfig,
@@ -42,8 +54,7 @@ class TorchSpyreProfilerWrapper(TorchProfilerWrapper):
                 torch_profiler_trace_dir,
             )
             logger.debug(
-                "Profiler config: record_shapes=%s,"
-                "profile_memory=%s,with_stack=%s,with_flops=%s",
+                "Profiler config: record_shapes=%s,profile_memory=%s,with_stack=%s,with_flops=%s",
                 profiler_config.torch_profiler_record_shapes,
                 profiler_config.torch_profiler_with_memory,
                 profiler_config.torch_profiler_with_stack,
