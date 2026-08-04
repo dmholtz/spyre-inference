@@ -17,9 +17,8 @@
 import os
 from contextlib import AbstractContextManager, nullcontext
 
-from typing_extensions import override
-
 import torch
+from typing_extensions import override
 
 # `import torch_spyre` is intentionally deferred to inside `init_device`.
 # Importing it loads `libspyre_comms.so`, which captures
@@ -29,14 +28,13 @@ import torch
 # loads. `spyre_inference/__init__.py` sets
 # `TORCH_DEVICE_BACKEND_AUTOLOAD=0` so torch's `[torch.backends]`
 # autoload doesn't trigger the load at `import torch` time.
-
 from vllm.logger import init_logger
-from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from spyre_inference.custom_ops import register_all
+from spyre_inference.v1.worker.profiler_wrapper import TorchSpyreProfilerWrapper
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -174,7 +172,9 @@ class TorchSpyreWorker(Worker):
             if self.profiler is None:
                 profiler_type = self.profiler_config.profiler
                 if profiler_type == "torch":
-                    self.profiler = TorchProfilerWrapper(
+                    # TODO: replace with vllm.profiler.wrapper.TorchProfilerWrapper once
+                    # PR https://github.com/vllm-project/vllm/pull/50977 lands in vLLM.
+                    self.profiler = TorchSpyreProfilerWrapper(
                         self.profiler_config,
                         worker_name=trace_name,
                         local_rank=self.local_rank,
