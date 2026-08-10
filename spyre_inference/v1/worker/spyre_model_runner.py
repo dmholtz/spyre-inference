@@ -60,6 +60,7 @@ from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.sample.spyre_sampler import SpyreTopKTopPSampler
 
 logger = init_logger(__name__)
 
@@ -351,6 +352,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+
+        # patch sampler
+        sampler = self.sampler
+        sampler.sampler = SpyreTopKTopPSampler.from_base_instance(sampler.sampler)
 
     @staticmethod
     def _patch_encoder_ops_for_spyre(model_config) -> None:
@@ -659,6 +664,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             pin_memory=False,
             with_numpy=numpy,
         )
+
+    def _sample(*args, **kwargs):
+        return super()._sample(*args, **kwargs)
 
 
 @contextmanager
