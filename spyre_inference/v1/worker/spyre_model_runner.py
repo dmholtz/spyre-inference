@@ -528,6 +528,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             dynamic=False,
         )
         logger.info("Wrapped %s as a single graph for Spyre.", model_name)
+        self.sampler = torch.compile(self.sampler, backend="inductor", fullgraph=False, dynamic=False)
 
     def _compile_blocks(self) -> int:
         num_blocks = 0
