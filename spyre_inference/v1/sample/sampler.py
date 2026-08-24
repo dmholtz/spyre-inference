@@ -5,7 +5,13 @@ from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, _SAMPLING_EPS
 
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+
 class SpyreSampler(Sampler):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.topk_topp_sampler = SpyreTopKTopPSampler()
     
     def forward(
         self,

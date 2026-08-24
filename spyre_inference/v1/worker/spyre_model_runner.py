@@ -81,6 +81,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.sample.sampler import SpyreSampler
 
 logger = init_logger(__name__)
 
@@ -396,6 +397,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        
+        self.sampler = SpyreSampler()
 
     @staticmethod
     def _install_pooling_model_patches(model_config) -> None:
@@ -471,6 +474,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self._spyre_device,
             keep_outputs_on_device=self._pooling_on_spyre,
         )
+        self.model._model.logits_processor = torch.compile(self.model._model.logits_processor)
 
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.
@@ -506,11 +510,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     defeated_by,
                 )
             num_blocks = self._compile_blocks()
+            num_norms = self._compile_final_norms()
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre. "
-                    "Embeddings and the final norm stay eager.",
+                    "Wrapped %d transformer blocks and %d final norm modules of %s for "
+                    "per-block compile on Spyre. Embeddings stay eager.",
                     num_blocks,
+                    num_norms,
                     model_name,
                 )
                 return
@@ -542,6 +548,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 block.compile(backend="inductor", fullgraph=True, dynamic=False)
                 num_blocks += 1
         return num_blocks
+
+    def _compile_final_norms(self) -> int:
+        num_norms = 0
+        seen: set[int] = set()
+        for name in ("norm",):
+            norm = getattr(self.model, name, None)
+            if not isinstance(norm, nn.Module):
+                continue
+            norm_id = id(norm)
+            if norm_id in seen:
+                continue
+            norm.compile(backend="inductor", fullgraph=True, dynamic=False)
+            seen.add(norm_id)
+            num_norms += 1
+        return num_norms
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.
