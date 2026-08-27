@@ -32,41 +32,49 @@ os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
 os.environ.setdefault("MASTER_PORT", "29500")
 
+import multiprocessing as mp
+
 import torch
 from torch.profiler import ProfilerActivity, profile
-from vllm import LLM, SamplingParams
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.config import AttentionConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-llm = LLM(
-    model="ibm-granite/granite-3.3-8b-instruct",
-    dtype="float16",
-    max_model_len=32,
-    max_num_seqs=1,
-    num_gpu_blocks_override=64,
-    attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
-    distributed_executor_backend="external_launcher",  # worker in-process
-)
+from vllm import LLM, SamplingParams
 
-os.makedirs("logs/", exist_ok=True)
 
-prompts = ["What do you know about Zurich?"]
-samplings = [SamplingParams(max_tokens=4, temperature=0.0)]
+def main():
+    llm = LLM(
+        model="ibm-granite/granite-3.3-8b-instruct",
+        dtype="float16",
+        max_model_len=64,
+        max_num_seqs=1,
+        num_gpu_blocks_override=64,
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+    )
 
-# Warmup
-for _ in range(2):
-    llm.generate(prompts, samplings)
+    os.makedirs("logs/", exist_ok=True)
 
-# Profiled generate
-with profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-    on_trace_ready=torch.profiler.tensorboard_trace_handler("logs/"),
-    record_shapes=True,
-    acc_events=True,
-) as prof:
-    outputs = llm.generate(prompts, samplings)
+    prompts = ["What do you know about Zurich?"]
+    samplings = [SamplingParams(max_tokens=4, temperature=0.0)]
 
-# Optional terminal summary
-print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20).replace("CUDA", "AIU"))
+    # Warmup
+    for _ in range(2):
+        llm.generate(prompts, samplings)
 
-os._exit(0)  # avoids TimestampCalibrator abort at teardown
+    # Profiled generate
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("logs/"),
+        record_shapes=True,
+        acc_events=True,
+    ) as prof:
+        _ = llm.generate(prompts, samplings)
+
+    # Optional terminal summary
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20).replace("CUDA", "AIU"))
+
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    main()
+    os._exit(0)  # avoids TimestampCalibrator abort at teardown
