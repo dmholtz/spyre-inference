@@ -252,8 +252,9 @@ MAX_TOKENS = 8
 
 
 def _generate_greedy(model: str, model_impl: str) -> list[list[int]]:
-    from vllm import LLM, SamplingParams
     from vllm.distributed import cleanup_dist_env_and_memory
+
+    from vllm import LLM, SamplingParams
 
     llm = LLM(
         model=model,
@@ -350,7 +351,6 @@ def test_mistral_format_repo_parses_to_a_config_hf_cannot_build_from(tmp_path):
     config.json, vLLM checks Mistral first and ends at a bare PretrainedConfig."""
     from transformers import AutoModel
     from transformers.configuration_utils import PretrainedConfig
-
     from vllm.transformers_utils.config import get_config
 
     hf_config = get_config(_model_repo(tmp_path, mistral_format=True), trust_remote_code=False)

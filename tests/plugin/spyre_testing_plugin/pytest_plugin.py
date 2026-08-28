@@ -67,16 +67,15 @@ import sys
 import tempfile
 import time
 import tomllib
-import torch.distributed as dist
-import torch.testing
-
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.testing
+import yaml
 from _pytest.mark.expression import IDENT_PREFIX, Expression
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-import yaml
 
 from spyre_testing_plugin.models import (
     AllowEntry,
@@ -880,7 +879,7 @@ def _spyre_session_config():
 
     type(current_platform)._enum = PlatformEnum.OOT
 
-    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
     from vllm.forward_context import set_forward_context
 
@@ -894,10 +893,10 @@ def _spyre_session_config():
 
 
 def _spyre_default_vllm_config(monkeypatch):
-    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
-    from vllm.platforms import PlatformEnum, current_platform
     from vllm.forward_context import set_forward_context
+    from vllm.platforms import PlatformEnum, current_platform
 
     monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
 
@@ -979,8 +978,8 @@ def tp_group(_distributed_init):
     Tests that create vLLM linear layers should use this fixture instead of
     (or in addition to) `default_vllm_config`.
     """
-    from vllm.distributed.parallel_state import GroupCoordinator
     import vllm.distributed.parallel_state as ps
+    from vllm.distributed.parallel_state import GroupCoordinator
 
     group = GroupCoordinator(
         group_ranks=[[0]],

@@ -28,10 +28,8 @@ import warnings
 
 import pytest
 import torch
-
-from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
-
 from spyre_testing_plugin.pytest_plugin import spyre_available
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
 
 
 def cpu_quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

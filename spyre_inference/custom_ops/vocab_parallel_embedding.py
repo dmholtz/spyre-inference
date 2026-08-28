@@ -18,7 +18,6 @@ from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
-
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (

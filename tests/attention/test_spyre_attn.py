@@ -18,17 +18,17 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
+from spyre_testing_plugin.pytest_plugin import spyre_available
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
-from vllm.utils.torch_utils import set_random_seed
+
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
-from spyre_testing_plugin.pytest_plugin import spyre_available
 
 pytestmark = pytest.mark.attention
 
@@ -51,8 +51,8 @@ def configure_device(request, monkeypatch):
 def configure_compilation(request, monkeypatch):
     """Configure torch.compile mode for tests."""
     import torch
-    from vllm.config.compilation import CompilationMode
     from vllm.config import get_cached_compilation_config
+    from vllm.config.compilation import CompilationMode
 
     mode_name = request.param
     compilation_mode = getattr(CompilationMode, mode_name)
@@ -943,7 +943,7 @@ def test_block_size_validation():
     for proper stick alignment during torch.compile. This test verifies the
     validation raises ValueError for invalid block sizes and accepts valid ones.
     """
-    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
 
     model_config = ModelConfig(
@@ -1018,7 +1018,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     contract (KV transfer, future tests, Mamba zeroing via
     get_kv_cache_block_dim) will allocate a transposed cache.
     """
-    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
@@ -1026,6 +1026,7 @@ def test_kv_cache_shape_matches_runner_allocation():
         KVCacheGroupSpec,
         KVCacheTensor,
     )
+
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
     from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 

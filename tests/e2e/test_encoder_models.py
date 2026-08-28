@@ -26,8 +26,9 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
-from vllm import LLM
 from vllm.config import PoolerConfig
+
+from vllm import LLM
 
 EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-125m-english",

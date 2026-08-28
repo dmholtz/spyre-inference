@@ -16,9 +16,10 @@
 Test SpyreRMSNorm custom op correctness against a reference implementation.
 """
 
+import sys
+
 import pytest
 import torch
-import sys
 
 
 def reference_rms_norm(
@@ -81,6 +82,7 @@ def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
 def test_rmsnorm_oot_dispatch():
     """Verify RMSNorm OOT registration: class swap."""
     from vllm.model_executor.layers.layernorm import RMSNorm
+
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     layer = RMSNorm(128, eps=1e-6)
