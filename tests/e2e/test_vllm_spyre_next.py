@@ -13,10 +13,9 @@
 # limitations under the License.
 
 import pytest
+from vllm import LLM, RequestOutput, SamplingParams
 from vllm.config import AttentionConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-from vllm import LLM, RequestOutput, SamplingParams
 
 
 @pytest.mark.uses_subprocess
