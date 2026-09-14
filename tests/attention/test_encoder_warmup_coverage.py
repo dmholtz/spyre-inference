@@ -65,23 +65,35 @@ class TestGateHasTwoSides:
 
 
 class TestLadderFallback:
-    """An uncovered batch snaps onto the ladder, never onto an invented shape."""
+    """An uncovered batch takes a ladder length and its exact batch."""
 
     @pytest.mark.parametrize(
         ("num_seqs", "max_len"),
         [(2, 300), (3, 300), (3, 511), (5, 65), (2, 511), (17, 100)],
     )
-    def test_result_is_always_a_ladder_cell(self, num_seqs, max_len):
-        batch, length = _ladder_encoder_shape(num_seqs, max_len, MAX_NUM_SEQS, MAX_MODEL_LEN)
-        assert batch in batch_buckets(MAX_NUM_SEQS)
+    def test_length_is_a_ladder_cell_and_batch_is_exact(self, num_seqs, max_len):
+        batch, length = _ladder_encoder_shape(num_seqs, max_len, MAX_MODEL_LEN)
         assert length in default_encoder_len_buckets(MAX_MODEL_LEN)
-        assert batch >= num_seqs
         assert length >= max_len
+        # Exact, not rounded onto a batch bucket: rounding B up multiplies the
+        # [B*Hkv, G, L, L] scores without reaching a warmed cell
+        # (TestRoundingTheBatchUpCannotRescueAMiss).
+        assert batch == num_seqs
 
     def test_does_not_emit_stick_aligned_non_buckets(self):
         # The regression this replaced: _align_up(300) == 320, which is not a
         # bucket, so every distinct prompt length compiled its own graph.
-        assert _ladder_encoder_shape(3, 300, MAX_NUM_SEQS, MAX_MODEL_LEN) == (4, 512)
+        assert _ladder_encoder_shape(3, 300, MAX_MODEL_LEN) == (3, 512)
+
+    def test_batch_is_not_rounded_past_the_token_budget(self):
+        """The allocation cliff: 9 skewed requests must not become B=16.
+
+        Rounding onto the batch ladder asked for 16*512 = 8192 slots against a 512
+        token budget, where the exact batch needs 9*512.
+        """
+        batch, length = _ladder_encoder_shape(9, 400, MAX_MODEL_LEN)
+        assert (batch, length) == (9, 512)
+        assert batch * length < 16 * 512
 
     def test_silent_during_warmup_and_logs_after(self, caplog):
         """Logged at info: above 8 sequences this is the ordinary path.
@@ -91,13 +103,13 @@ class TestLadderFallback:
         """
         spyre_attn._warmup_complete = False
         with caplog.at_level("INFO"):
-            _ladder_encoder_shape(64, 8, MAX_NUM_SEQS, MAX_MODEL_LEN)
+            _ladder_encoder_shape(64, 8, MAX_MODEL_LEN)
         assert "ladder shape" not in caplog.text, "warmup's own body runs are not news"
 
         spyre_attn.mark_warmup_complete()
         with caplog.at_level("INFO"):
-            _ladder_encoder_shape(3, 300, MAX_NUM_SEQS, MAX_MODEL_LEN)
-        assert "ladder shape (B=4, L=512)" in caplog.text
+            _ladder_encoder_shape(3, 300, MAX_MODEL_LEN)
+        assert "ladder shape (B=3, L=512)" in caplog.text
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
     def test_log_dedup_key_is_bounded(self, caplog):
@@ -110,7 +122,7 @@ class TestLadderFallback:
         spyre_attn.mark_warmup_complete()
         with caplog.at_level("INFO"):
             for max_len in range(257, 512):
-                _ladder_encoder_shape(3, max_len, MAX_NUM_SEQS, MAX_MODEL_LEN)
+                _ladder_encoder_shape(3, max_len, MAX_MODEL_LEN)
         assert caplog.text.count("ladder shape") <= 1
 
 

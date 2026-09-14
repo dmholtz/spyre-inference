@@ -53,7 +53,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    batch_buckets,
     default_encoder_len_buckets,
     next_bucket,
     pick_encoder_attention_shape,
@@ -554,34 +553,33 @@ def _indices_for_device(indices: torch.Tensor, device: torch.device) -> torch.Te
 def _ladder_encoder_shape(
     num_seqs: int,
     max_len: int,
-    max_num_seqs: int,
     max_model_len: int,
 ) -> tuple[int, int]:
-    """Snap a batch no warmed cell covers onto the warmup ladder.
+    """Snap a batch no warmed cell covers onto the warmup length ladder.
 
-    ``pick_encoder_attention_shape`` misses routinely, not exceptionally: warmup
-    drops every cell with ``B*L > max_num_batched_tokens``, so two 300-token
-    prompts have no warmed ``(2, 512)`` to land on. Stick-aligning ``max_len``
-    instead would emit non-buckets (320, 448, ...) and so one compile per
-    distinct prompt length; the ladder is finite, so misses stop recurring.
+    ``pick_encoder_attention_shape`` misses routinely, not exceptionally: warmup drops
+    every cell with ``B*L > encoder_cell_budget(...)``, so two 300-token prompts have no
+    warmed ``(2, 512)`` to land on. Stick-aligning ``max_len`` instead would emit
+    non-buckets (320, 448, ...), one compile per distinct prompt length.
+
+    The batch stays exact. Rounding it up cannot help -- the caller already searched
+    every warmed cell -- and costs, since scores are ``[B*Hkv, G, L, L]``: one 400-token
+    request with eight short ones would round to ``(16, 512)``, mostly padding.
     """
-    batch = next_bucket(num_seqs, batch_buckets(max_num_seqs))
+    batch = num_seqs
     length = next_bucket(max_len, default_encoder_len_buckets(max_model_len))
     # Warmup's own body runs miss too (max_num_seqs seqs of size//B tokens) and
     # compiling those is the point, so only a serving-path miss is news.
     #
-    # info, not warning: the platform caps pooling max_num_batched_tokens at 512
-    # and pooling_warmup_shapes drops every cell over that budget, so only batch
-    # buckets 1/2/4/8 are warmed at max_num_seqs=64 and any larger batch takes
-    # this path normally. Nothing is wrong and there is no action to take, and
-    # _call_kernel already reports the compile itself.
+    # info, not warning: pooling_warmup_shapes warms a finite set, so a batch wider
+    # than it takes this path normally. _call_kernel reports the compile itself.
     if is_warmup_complete():
         # Args are part of info_once's dedup key, so they must be the ladder
         # cell and not the request: num_seqs x max_len has thousands of values.
         logger.info_once(
             "Encoder attention fell back to ladder shape (B=%d, L=%d): no warmed cell covers "
-            "the batch, so this compiles on first use. Warmup drops cells with "
-            "B*L > max_num_batched_tokens -- see pooling_warmup_shapes.",
+            "the batch, so this compiles on first use. Warmup covers B*L up to "
+            "encoder_cell_budget -- see pooling_warmup_shapes.",
             batch,
             length,
         )
@@ -628,9 +626,7 @@ def _ensure_encoder_pack(
     if pair is not None:
         batch_bucket, aligned_len = pair
     else:
-        batch_bucket, aligned_len = _ladder_encoder_shape(
-            num_seqs, max_len, cached_max_num_seqs, cached_max_model_len
-        )
+        batch_bucket, aligned_len = _ladder_encoder_shape(num_seqs, max_len, cached_max_model_len)
     query_lens = _content_query_lens(qsl_lens, kv_lens, num_actual_tokens=n)
     orig_q_starts = q_starts
     orig_query_lens = query_lens
@@ -885,7 +881,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             output.copy_(result)
 
         return output
-
 
 class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
     """Encoder-only (no KV cache) variant of the Spyre backend."""
