@@ -97,7 +97,9 @@ from spyre_inference.v1.pool import (
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    default_encoder_len_buckets,
     logits_row_buckets,
+    next_bucket,
     pooling_warmup_shapes,
 )
 
@@ -901,19 +903,50 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             return
 
+        budget = self.scheduler_config.max_num_batched_tokens
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
         try:
             for batch_size, prompt_len in shapes:
                 self.scheduler_config.max_num_seqs = batch_size
-                num_tokens = batch_size * prompt_len
+                # A cell may sit above the token budget (ENCODER_CELL_BUDGET_SLACK) while
+                # _dummy_run asserts num_tokens <= budget, so a uniform B*L fill cannot
+                # warm it. One full-length sequence plus B-1 single-token ones carries the
+                # same num_seqs and max_query_len, all the cell keys on. That fill can
+                # overrun the budget too (L == budget suffices), so clamp it.
+                skewed = batch_size * prompt_len > budget
+                num_tokens = (
+                    min(prompt_len + batch_size - 1, budget) if skewed else batch_size * prompt_len
+                )
+                if skewed:
+                    # create_mixed_batch takes min(B-1, num_tokens//2) single-token rows
+                    # and gives the rest to one prefill row, so the traced cell is
+                    # (rows, bucket(prefill_len)) -- the requested one only if both match.
+                    # Skip rather than mislabel; serving snaps such a batch onto the ladder.
+                    decode_rows = min(batch_size - 1, num_tokens // 2)
+                    prefill_len = num_tokens - decode_rows
+                    lengths = default_encoder_len_buckets(self.model_config.max_model_len)
+                    if (
+                        decode_rows != batch_size - 1
+                        or next_bucket(prefill_len, lengths) != prompt_len
+                    ):
+                        logger.warning(
+                            "Pooling attention warmup: skipping cell batch_size=%d "
+                            "prompt_len=%d -- no skewed batch within the token budget "
+                            "carries it.",
+                            batch_size,
+                            prompt_len,
+                        )
+                        continue
                 logger.info(
-                    "Pooling attention warmup: exact bucket "
-                    "batch_size=%d prompt_len=%d (%d tokens)",
+                    "Pooling attention warmup: %s bucket batch_size=%d prompt_len=%d (%d tokens)",
+                    "skewed" if skewed else "exact",
                     batch_size,
                     prompt_len,
                     num_tokens,
                 )
-                hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
+                hidden_states, _ = self._dummy_run(
+                    num_tokens, force_attention=True, create_mixed_batch=skewed
+                )
                 self._dummy_pooler_run(hidden_states)
                 if batch_size == 1:
                     # An exact fill satisfies _is_b1_fused_sdpa, so the run above
