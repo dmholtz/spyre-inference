@@ -82,9 +82,12 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.models.mistral import reset_llama4_scale_cache
+from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
+    SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
     mark_warmup_complete,
@@ -92,7 +95,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -308,12 +310,14 @@ class _SpyreModelWrapper:
         spyre_device: torch.device,
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
+        shape_bucketer: SpyreShapeBucketer | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
+        object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -338,6 +342,9 @@ class _SpyreModelWrapper:
             val = kwargs.get(key)
             kwargs_converted[key] = _convert_int(val)
 
+        # The Llama-4 scale cache keys on `positions` identity, blind to an in-place rewrite.
+        reset_llama4_scale_cache()
+
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
@@ -354,6 +361,85 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
+
+    def embed_multimodal(self, **kwargs):
+        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
+
+        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
+        input conversion, so pixel tensors would otherwise arrive on CPU while the
+        vision weights are on Spyre.
+        """
+
+        def _to_spyre_float(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                return convert(t, dtype=torch.float16, device=self._spyre_device)
+            return t
+
+        kwargs = tree_map(_to_spyre_float, kwargs)
+        out = self._model.embed_multimodal(**kwargs)
+        return out
+
+    def embed_input_ids(
+        self,
+        input_ids,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal=None,
+    ):
+        """Text-token embedding + multimodal merge, Spyre-aware.
+
+        Like ``embed_multimodal``, this is reached through ``__getattr__`` with
+        ``input_ids`` still on CPU. The text lookup runs on-card either way; when
+        images are present the merge is done on CPU, because upstream scatters image
+        rows with a dim-0 boolean mask that Spyre cannot do.
+        """
+        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        if has_mm and is_multimodal is None:
+            raise ValueError(
+                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
+                "CPU merge below needs the mask."
+            )
+        # The text lookup skips upstream's `masked_fill(is_multimodal, 0)`, so an
+        # out-of-vocab placeholder id would index the embedding table out of range.
+        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
+            raise NotImplementedError(
+                "SpyreModelWrapper.embed_input_ids does not support models with "
+                "out-of-vocab multimodal tokens; mask them before the text embedding."
+            )
+
+        # Bucket the token count: this runs on the raw scheduled count, so at TP>1 the
+        # vocab-parallel all_reduce is `num_tokens * hidden` for every distinct prompt
+        # length, and some of those collective schedules fail to build. Pad on CPU and
+        # trim after; padding inside a compiled collective corrupts output.
+        num_tokens = input_ids.shape[0]
+        bucketer = self._shape_bucketer
+        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if padded_tokens is not None and padded_tokens != num_tokens:
+            input_ids = torch.nn.functional.pad(input_ids, (0, padded_tokens - num_tokens))
+        else:
+            padded_tokens = None
+
+        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        inputs_embeds = self._model.embed_input_ids(input_ids)
+        if padded_tokens is not None:
+            inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
+
+        if not has_mm:
+            return inputs_embeds
+
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        inputs_embeds = convert(inputs_embeds, device="cpu")
+        mm_embeds_cpu = tree_map(
+            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+            multimodal_embeddings,
+        )
+        merged = _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=mm_embeds_cpu,
+            is_multimodal=is_multimodal.to("cpu"),
+        )
+        return convert(merged, device=self._spyre_device)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -459,7 +545,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
         install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
-        install_mlp_pad_weight_loader(model_loader, self.model_config.hf_config)
+        install_mlp_pad_weight_loader(model_loader, self.model_config.hf_text_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -480,7 +566,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Restore original RoPE frequencies and attention scale corrupted by the
         # head_dim width override (no-op unless the platform padded head_dim).
         verify_padded_head_dim(self.model, self.model_config.hf_config)
-        verify_padded_intermediate_size(self.model, self.model_config.hf_config)
+        verify_padded_intermediate_size(self.model, self.model_config.hf_text_config)
         fix_padded_rope(self.model, self.model_config.hf_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_config)
 
@@ -503,6 +589,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
+        # Patches instances, so it runs after load and before compile wraps modules
+        # in OptimizedModule and breaks traversal.
+        apply_multimodal_patches(self.model, self._spyre_device)
+
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
@@ -520,6 +610,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if bucketer is None
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
+            shape_bucketer=bucketer,
         )
 
     @staticmethod
@@ -737,7 +828,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
-        self._record_attention_graphs(bucket_sizes)
+        self._record_attention_graphs()
 
     @torch.inference_mode()
     def _record_encoder_pack_graphs(self) -> None:
@@ -764,7 +855,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
-    def _record_attention_graphs(self, token_counts: list[int]) -> None:
+    def _record_attention_graphs(self) -> None:
         """Pre-compile the attention.
 
         The model-level warmup above cannot cover these: ``_dummy_run`` delegates
@@ -789,18 +880,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         static_ctx = self.compilation_config.static_forward_context
         t0 = time.time()
         total = 0
-        # The metadata builders' own bucketer, not a second one built here, so
-        # every bucket recorded is one build() can actually produce.
-        bucketer = self._resolve_builder_attn_bucketer()
-        assert bucketer is not None, "No attention metadata builder exposes a bucketer"
+        builders = self._attn_metadata_builders()
         with _set_spyre_compilation_settings(self.vllm_config):
             for layer_name, kv_cache in self._spyre_kv_caches.items():
                 layer = static_ctx.get(layer_name)
                 impl = getattr(layer, "impl", None)
                 if not isinstance(impl, SpyreAttentionImpl):
                     continue
+                builder = builders.get(layer_name)
+                # A KV-cache layer on this impl is always in an attention group whose
+                # backend builds SpyreAttentionMetadataBuilder, so a miss is a wiring or
+                # ordering bug (recording before initialize_attn_backend), not a config.
+                assert builder is not None, (
+                    f"Layer {layer_name} has a Spyre attention impl and a KV cache but no "
+                    "Spyre metadata builder; initialize_attn_backend() must run first."
+                )
                 logger.info("Recording attention graphs for layer %s...", layer_name)
-                total += impl.record_graphs(self._spyre_device, bucketer, kv_cache)
+                total += impl.record_graphs(layer, kv_cache, builder)
         logger.info(
             "Attention graph recording complete: %d graphs in %.3fs.",
             total,
@@ -809,40 +905,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Past the early returns: with recording off, first-use compiles are intended.
         mark_warmup_complete()
 
-    def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
-        """The attention bucketer the metadata builders dispatch against.
-
-        Returned rather than constructed here, so the recorder compiles exactly
-        the buckets ``build()`` rounds onto -- a second, independently built
-        instance could drift and make every request pad to an unrecorded block
-        count. A model can have several attention groups and, under ubatching,
-        several builders per group; the assert below guards against a future
-        spec-dependent bucket, since today all builders derive buckets from
-        ``cache_config``/``model_config`` alone and so agree by construction.
-        Returns None when no builder exposes a bucketer.
-        """
-        first: SpyreAttnBucketer | None = None
+    def _attn_metadata_builders(self) -> dict[str, SpyreAttentionMetadataBuilder]:
+        """Each layer's metadata builder: attention groups' specs (block size, sliding
+        window) need not agree, and a group's ubatch builders differ only in internal
+        buffers, so the first stands for all."""
+        builders: dict[str, SpyreAttentionMetadataBuilder] = {}
         for group in self._attn_group_iterator():
-            for builder in group.metadata_builders:
-                bucketer = getattr(builder, "_attn_bucketer", None)
-                if bucketer is None:
-                    continue
-                if first is None:
-                    first = bucketer
-                    continue
-                assert (bucketer.block_size, bucketer.num_blocks_buckets) == (
-                    first.block_size,
-                    first.num_blocks_buckets,
-                ), (
-                    "Attention bucketer buckets diverge between metadata builders: "
-                    f"{type(builder).__name__} has block_size={bucketer.block_size} "
-                    f"num_blocks={bucketer.num_blocks_buckets}, expected "
-                    f"block_size={first.block_size} "
-                    f"num_blocks={first.num_blocks_buckets}. Only one set can be "
-                    "recorded, so a mismatch means some builder pads onto block "
-                    "counts no kernel was compiled for."
-                )
-        return first
+            builder = group.metadata_builders[0] if group.metadata_builders else None
+            if not isinstance(builder, SpyreAttentionMetadataBuilder):
+                continue
+            for layer_name in group.layer_names:
+                builders[layer_name] = builder
+        return builders
 
     def _determine_batch_execution_and_padding(
         self,
@@ -1182,7 +1256,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+        from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
         # One spec per layer. disable_hybrid_kv_cache_manager (set in the
         # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs

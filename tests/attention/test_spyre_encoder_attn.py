@@ -1140,3 +1140,39 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
     # encoder case work, not a widened ladder.
     with pytest.raises(AssertionError, match="exceeds the largest recorded bucket"):
         _profile_metadata(AttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1)
+
+
+def test_eager_config_has_no_body_ladder_to_cache(monkeypatch) -> None:
+    """``--enforce-eager`` leaves ``compile_sizes`` unset, and init must tolerate it.
+
+    ``apply_config_platform_defaults`` returns at ``CompilationMode.NONE`` before it
+    builds the body ladder, so every eager pooling engine died in this constructor.
+    """
+    from vllm.config import (
+        CompilationMode,
+        DeviceConfig,
+        ModelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.platforms import PlatformEnum, current_platform
+
+    monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        model_config=ModelConfig(dtype=torch.float16, enforce_eager=True),
+    )
+    assert config.compilation_config.mode == CompilationMode.NONE
+    assert config.compilation_config.compile_sizes is None, "the hook now builds a ladder here"
+    with set_current_vllm_config(config):
+        impl = SpyreEncoderAttentionImpl(
+            num_heads=16,
+            head_size=64,
+            scale=64**-0.5,
+            num_kv_heads=4,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            logits_soft_cap=None,
+        )
+    assert impl._cached_body_buckets == []

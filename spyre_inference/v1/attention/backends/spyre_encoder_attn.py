@@ -49,8 +49,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _call_kernel,
     is_warmup_complete,
-    slot_major_kv_layout,
 )
+from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
@@ -779,8 +779,16 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             max_num_batched_tokens=self._cached_max_num_batched_tokens,
             len_bucket=default_encoder_len_buckets(self._cached_max_model_len),
         )
-        # The runner's 1D body ladder, the pack kernel's second shape axis.
-        self._cached_body_buckets = [int(size) for size in cfg.compilation_config.compile_sizes]
+        # The runner's 1D body ladder, the pack kernel's second shape axis. None under
+        # enforce_eager, where the platform hook never builds it and record_pack_graphs
+        # has nothing to trace.
+        body_buckets = cfg.compilation_config.compile_sizes or ()
+        self._cached_body_buckets = [int(size) for size in body_buckets]
+
+    def record_graphs(self, *args, **kwargs) -> int:
+        """Nothing to page: ``forward`` packs Q/K/V, and its shapes are warmed by the
+        runner's ``_warmup_pooling_bucket_shapes`` plus ``record_pack_graphs``."""
+        return 0
 
     def forward(  # ty: ignore[invalid-method-override]
         self,

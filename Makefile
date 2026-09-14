@@ -42,6 +42,11 @@ endif
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
 PYTEST_ARGS ?= -s -vvv
 
+# Set before the interpreter, not in configure_threading: torch sizes its OpenMP pool
+# at import, and vLLM's per-test fork then segfaults in gomp_team_start.
+OMP_THREADS ?=
+OMP_ENV := $(if $(OMP_THREADS),OMP_NUM_THREADS=$(OMP_THREADS))
+
 # When set, write JUnit XML here (CI callers set this to collect results
 # for artifact upload / result ingestion). Unset = no JUnit file.
 JUNIT_XML ?=
@@ -98,10 +103,14 @@ else ifeq ($(TEST_TYPE),integration)
 # Single-invocation integration = the CI smoke suite, which now also carries the
 # compiled (enforce_eager=False) tests/e2e/test_compile.py cases. Probes are
 # excluded here just as the sharded smoke jobs exclude them (they run in their
-# own test-probes job and must not gate integration on strict-xfail flips).
-MARK_EXPR := -m "not (distributed or upstream or attention or probe)"
+# own test-probes job and must not gate integration on strict-xfail flips), and
+# the model-quality gate likewise has its own job: every case compiles a product
+# model, up to the 31B decoders.
+MARK_EXPR := -m "not (distributed or upstream or attention or probe or model_quality)"
 else ifeq ($(TEST_TYPE),unit)
-MARK_EXPR := -m "not upstream"
+# model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
+# out of the unit tier as well.
+MARK_EXPR := -m "not (upstream or model_quality)"
 else
 # The validation above already rejected any type outside VALID_TEST_TYPES, so
 # a value that reaches here IS valid but has no marker mapping above -- i.e. a
@@ -114,7 +123,9 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-smoke-shard test-probes test-probes-shard test-attention test-attention-shard \
+        test-smoke test-smoke-shard test-model-quality test-model-quality-shard \
+        test-probes test-probes-shard \
+        test-attention test-attention-shard \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
         test-upstream-distributed tests-single-card tests-multi-card
 
@@ -164,10 +175,10 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
+	$(OMP_ENV) $(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
 
-test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-probe). Carries the compiled e2e cases.
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe)' JUNIT_XML=$(JUNIT_XML)
+test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-probe, non-model-quality). Carries the compiled e2e cases.
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe or model_quality)' JUNIT_XML=$(JUNIT_XML)
 
 # The smoke suite is dominated by a handful of e2e model tests (including the
 # compiled enforce_eager=False cases in tests/e2e/test_compile.py), so CI fans it
@@ -178,7 +189,7 @@ test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-at
 SMOKE_SHARDS ?= 8
 SMOKE_SHARD_ID ?= 0
 test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe)' \
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe or model_quality)' \
 	  PYTEST_ARGS='$(PYTEST_ARGS) --smoke-shards=$(SMOKE_SHARDS) --smoke-shard-id=$(SMOKE_SHARD_ID)' \
 	  JUNIT_XML=$(JUNIT_XML)
 
@@ -186,6 +197,26 @@ test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
 # artifact name is unique; the pattern maps <i> to SMOKE_SHARD_ID.
 test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# Carved out of smoke: every case compiles a product model, up to the 31B decoders.
+test-model-quality: ## Run the product-model output-quality gates against the cached HF references. Unsharded (local full run).
+	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+# CI fans the gate out across parallel shard jobs like smoke/attention; the plugin's
+# weighted partition (--quality-shards) balances by recorded runtime when a durations file
+# is present, else by decoder-vs-encoder path weight. No partition beats the slowest single
+# case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
+QUALITY_SHARDS ?= 6
+QUALITY_SHARD_ID ?= 0
+test-model-quality-shard: ## Run one model-quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i).
+	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --quality-shards=$(QUALITY_SHARDS) --quality-shard-id=$(QUALITY_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-model-quality-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to QUALITY_SHARD_ID.
+test-model-quality-shard-%:
+	$(MAKE) test-model-quality-shard QUALITY_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 test-probes: ## Run the torch-spyre backend probes (excluded from integration), unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' JUNIT_XML=$(JUNIT_XML)
@@ -271,16 +302,20 @@ test-upstream-shard: ## Run one non-distributed upstream shard (UPSTREAM_SHARDS=
 test-upstream-shard-%:
 	$(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
+# The only combo that forks per test (fork_new_process_for_each_test).
 test-upstream-distributed: ## Run the upstream+distributed marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' JUNIT_XML=$(JUNIT_XML)
+	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' OMP_THREADS=1 JUNIT_XML=$(JUNIT_XML)
 
 # Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
-tests-single-card: ## Run the 1-card marker combos (smoke shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
+tests-single-card: ## Run the 1-card marker combos (smoke shards / model-quality shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	for i in $$(seq 0 $$(( $(SMOKE_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-smoke-shard-$$i" && $(MAKE) test-smoke-shard SMOKE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-shard-$$i/junit-test-smoke-shard-$$i.xml" || rc=1; \
+	done; \
+	for i in $$(seq 0 $$(( $(QUALITY_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-model-quality-shard-$$i" && $(MAKE) test-model-quality-shard QUALITY_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-model-quality-shard-$$i/junit-test-model-quality-shard-$$i.xml" || rc=1; \
 	done; \
 	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
