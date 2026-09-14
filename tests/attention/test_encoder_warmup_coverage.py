@@ -27,8 +27,10 @@ import pytest
 
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    _is_b1_dense_body,
     _is_b1_fused_sdpa,
     _ladder_encoder_shape,
+    reachable_pack_shapes,
 )
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -224,6 +226,79 @@ class TestPoolingWarmupCoversBothSides:
 
 # (max_num_seqs, max_model_len, token budget)
 _CONFIGS = [(64, 512, 512), (64, 512, 2048), (64, 512, 8192), (32, 512, 512), (48, 320, 512)]
+
+
+class TestPackKernelShapesAreAllRecorded:
+    """``record_pack_graphs`` must leave the pack kernel nothing to compile.
+
+    Its two shape axes come from different bucketers, so coverage is asserted by
+    replaying steps through the serving path's own dispatch, not by listing shapes.
+    """
+
+    @staticmethod
+    def _recorded_keys(max_num_seqs, max_model_len, budget):
+        """What the kernel actually keys on: ``(dest rows, source rows)``."""
+        cells = pooling_warmup_shapes(
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=budget,
+            len_bucket=default_encoder_len_buckets(max_model_len),
+        )
+        triples = reachable_pack_shapes(cells, default_encoder_len_buckets(budget), budget)
+        return cells, {(batch * length + 1, num_src) for batch, length, num_src in triples}
+
+    @staticmethod
+    def _step_pack_key(query_lens, cells, max_num_seqs, max_model_len, budget):
+        """The pack shape one step reaches, mirroring ``_ensure_encoder_pack``.
+
+        ``None`` when the step never calls the kernel: no warmed cell covers it (the
+        ladder compiles by design) or ``_is_b1_dense_body`` skips the pack.
+        """
+        pair = pick_encoder_attention_shape(
+            len(query_lens), max(query_lens), cells, max_num_seqs, max_model_len, budget
+        )
+        if pair is None:
+            return None
+        batch, aligned_len = pair
+        padded_tokens = next_bucket(sum(query_lens), default_encoder_len_buckets(budget))
+        if _is_b1_dense_body(batch, padded_tokens, aligned_len):
+            return None
+        return batch * aligned_len + 1, padded_tokens
+
+    @pytest.mark.parametrize(("max_num_seqs", "max_model_len", "budget"), _CONFIGS)
+    def test_no_step_reaches_an_unrecorded_shape(self, max_num_seqs, max_model_len, budget):
+        cells, recorded = self._recorded_keys(max_num_seqs, max_model_len, budget)
+        checked = 0
+        for num_seqs in range(1, max_num_seqs + 1):
+            for length in range(1, max_model_len + 1, 7):
+                # Uniform, then skewed: one long sequence with short company, which
+                # is what a real mixed-length step looks like.
+                for lens in ([length] * num_seqs, [length] + [3] * (num_seqs - 1)):
+                    if sum(lens) > budget:
+                        continue
+                    key = self._step_pack_key(lens, cells, max_num_seqs, max_model_len, budget)
+                    if key is None:
+                        continue
+                    assert key in recorded, (
+                        f"step {num_seqs}x{length} packs {key}, which warmup never traced"
+                    )
+                    checked += 1
+        assert checked > 100, f"only {checked} steps reached the kernel -- test is near-vacuous"
+
+    def test_the_measured_miss_is_covered(self):
+        """The one post-warmup compile a 1000-request benchmark still showed:
+        cell ``(5, 512)`` traced at 1024 source rows by its skewed fill, served at 2048.
+        """
+        _cells, recorded = self._recorded_keys(MAX_NUM_SEQS, MAX_MODEL_LEN, 2048)
+        assert (5 * 512 + 1, 2048) in recorded
+
+    def test_dense_single_sequence_is_left_out_but_a_padded_one_is_not(self):
+        """``B=1`` skips the pack only when the body bucket *is* the length bucket."""
+        body = default_encoder_len_buckets(2048)
+        assert (1, 512, 512) not in reachable_pack_shapes([(1, 512)], body, 2048)
+        # max_model_len 320 tops the length ladder at 320 and the body ladder at 512,
+        # so one 300-token sequence packs 320 rows out of 512.
+        assert (1, 320, 512) in reachable_pack_shapes([(1, 320)], body, 2048)
 
 
 class TestRoundingTheBatchUpCannotRescueAMiss:

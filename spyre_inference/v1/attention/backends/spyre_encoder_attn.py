@@ -514,6 +514,34 @@ def scatter_pack(
     return packed
 
 
+def reachable_pack_shapes(
+    cells: list[tuple[int, int]],
+    body_buckets: list[int],
+    max_num_batched_tokens: int,
+) -> list[tuple[int, int, int]]:
+    """``(batch, aligned_len, num_src)`` triples the pack kernel can be called with.
+
+    ``_index_copy_kernel`` guards on dest rows (``B*L + 1``) *and* source rows (the
+    body token bucket). Those axes come from different bucketers and vary
+    independently, so a warmed cell reached at a new token count still compiles.
+
+    Source rows cap at the bucket covering ``min(budget, B*L)`` -- every sequence in a
+    cell fits ``L`` -- but have no lower bound, because ``L`` is the smallest *warmed*
+    length: three 134-token sequences land on ``(3, 320)`` with a 256-row body.
+
+    Only what ``_is_b1_dense_body`` skips is dropped, which is narrower than all of
+    ``B == 1``: the ladders can disagree at the top (``max_model_len`` 320 vs a 512
+    budget), leaving one sequence with more body rows than its own length bucket.
+    """
+    triples: set[tuple[int, int, int]] = set()
+    for batch, aligned_len in cells:
+        widest = next_bucket(min(max_num_batched_tokens, batch * aligned_len), body_buckets)
+        for num_src in body_buckets:
+            if num_src <= widest and not _is_b1_dense_body(batch, num_src, aligned_len):
+                triples.add((batch, aligned_len, num_src))
+    return sorted(triples)
+
+
 def gather_unpack(
     attn_out: torch.Tensor,
     unpack_indices: torch.Tensor,
@@ -751,6 +779,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             max_num_batched_tokens=self._cached_max_num_batched_tokens,
             len_bucket=default_encoder_len_buckets(self._cached_max_model_len),
         )
+        # The runner's 1D body ladder, the pack kernel's second shape axis.
+        self._cached_body_buckets = [int(size) for size in cfg.compilation_config.compile_sizes]
 
     def forward(  # ty: ignore[invalid-method-override]
         self,
@@ -881,6 +911,70 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             output.copy_(result)
 
         return output
+
+    def record_pack_graphs(self, device: torch.device) -> int:
+        """Trace ``scatter_pack`` on every ``reachable_pack_shapes`` triple.
+
+        Warmup's dummy runs reach the pack kernel at one body bucket per cell, leaving
+        most of its shape grid uncompiled. Tracing it needs no model forward, so the
+        whole grid is affordable here.
+
+        Returns the number of traces; a failure is logged and skipped, costing one lazy
+        compile rather than a dead engine.
+        """
+        if not self._compile_attn or device.type != "spyre":
+            return 0
+        triples = reachable_pack_shapes(
+            self._cached_encoder_shapes,
+            self._cached_body_buckets,
+            self._cached_max_num_batched_tokens,
+        )
+        # Q packs with num_heads, K/V with num_kv_heads: one family under MHA, two GQA.
+        head_counts = sorted({self.num_heads, self.num_kv_heads})
+        recorded = 0
+        # The kernel sees B*L + 1 dest rows, not B and L, so equal-area cells share one.
+        seen: set[tuple[int, int]] = set()
+        for batch, aligned_len, num_src in triples:
+            if (batch * aligned_len, num_src) in seen:
+                continue
+            seen.add((batch * aligned_len, num_src))
+            # Values never reach the guards but must stay in range: a wide cell at a
+            # small body bucket has fewer source rows than sequences, so fill what fits.
+            per_seq = min(aligned_len, max(1, num_src // batch))
+            filled = min(batch, num_src // per_seq)
+            dest = _indices_for_device(
+                host_scatter_pack_dest(
+                    [seq * per_seq for seq in range(filled)],
+                    [per_seq] * filled,
+                    aligned_len,
+                    num_src,
+                    batch * aligned_len,
+                ),
+                device,
+            )
+            for num_heads in head_counts:
+                # Unpadded head size so _pad_head_dim_to_stick runs as in forward --
+                # the traced layout must match the one serving hands the kernel.
+                flat = convert(
+                    torch.zeros(num_src, num_heads, self.head_size, dtype=self.model_dtype),
+                    device,
+                )
+                try:
+                    scatter_pack(flat, dest, batch, aligned_len, _align_up(self.head_size))
+                except Exception:
+                    logger.warning(
+                        "Encoder pack graph (B=%d, L=%d, src=%d, H=%d) failed to record; "
+                        "it will compile on first use instead.",
+                        batch,
+                        aligned_len,
+                        num_src,
+                        num_heads,
+                        exc_info=True,
+                    )
+                    continue
+                recorded += 1
+        return recorded
+
 
 class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
     """Encoder-only (no KV cache) variant of the Spyre backend."""

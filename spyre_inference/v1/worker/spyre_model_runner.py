@@ -89,6 +89,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
     mark_warmup_complete,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    SpyreEncoderAttentionImpl,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
@@ -681,6 +684,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._dummy_run(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
+                self._record_encoder_pack_graphs()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             # Pooling never reaches _record_attention_graphs (encoder layers have
@@ -734,6 +738,30 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs(bucket_sizes)
+
+    @torch.inference_mode()
+    def _record_encoder_pack_graphs(self) -> None:
+        """Trace the encoder pack kernel on every reachable shape.
+
+        The dummy runs above cannot: the kernel keys on the cell *and* the body token
+        bucket, and one run visits a single pair.
+        """
+        if not envs.SPYRE_ATTN_RECORD:
+            logger.info("Encoder pack graph recording disabled (SPYRE_ATTN_RECORD=0)")
+            return
+        static_ctx = self.compilation_config.static_forward_context
+        t0 = time.time()
+        total = 0
+        # Layers with the same head config share a graph; only the first pays a compile.
+        for layer in static_ctx.values():
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, SpyreEncoderAttentionImpl):
+                total += impl.record_pack_graphs(self._spyre_device)
+        logger.info(
+            "Encoder pack graph recording complete: %d graphs in %.3fs.",
+            total,
+            time.time() - t0,
+        )
 
     @torch.inference_mode()
     def _record_attention_graphs(self, token_counts: list[int]) -> None:
