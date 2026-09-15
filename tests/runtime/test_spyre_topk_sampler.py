@@ -75,3 +75,24 @@ def test_swapped_sampler_matches_stock_tokens(rows: int, vocab: int) -> None:
     out_swap = swapped(logits=logits.clone(), sampling_metadata=meta).sampled_token_ids
 
     assert torch.equal(out_stock, out_swap)
+
+
+def test_runner_installs_spyre_topk_sampler() -> None:
+    """The runner's __init__ installs SpyreTopKTopPSampler -- guards the swap itself."""
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config.compilation import CompilationConfig
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            max_model_len=1,
+            dtype=torch.float16,
+            trust_remote_code=True,
+        ),
+        cache_config=CacheConfig(block_size=128),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+    assert type(runner.sampler.topk_topp_sampler) is SpyreTopKTopPSampler
