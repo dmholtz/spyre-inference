@@ -680,17 +680,14 @@ def _ensure_encoder_pack(
     q_dest = host_scatter_pack_dest(q_starts, query_lens, aligned_len, padded_tokens, dummy_row)
     kv_dest = host_scatter_pack_dest(q_starts, kv_pack_lens, aligned_len, padded_tokens, dummy_row)
     unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, padded_tokens)
-    mask_cpu = build_attention_mask(
+    key_pad = build_key_pad_mask(
         batch_bucket,
         aligned_len,
         query_lens,
         kv_lens,
+        num_kv_heads,
         dtype=query.dtype,
-        device=torch.device("cpu"),
     )
-    key_pad = host_key_pad_mask(mask_cpu, num_kv_heads)
-    # Do not H2D ``mask_cpu`` ([B, 1, L, L]). Forward only needs (B, L) plus
-    # this key-pad; at B=8, L=512 the unused copy is ~4 MB fp16 per step.
     if target_device.type == "spyre":
         key_pad = convert(key_pad, target_device)
     else:
@@ -750,6 +747,38 @@ def build_attention_mask(
     if device.type == "spyre":
         return convert(mask, device)
     return mask.to(device)
+
+
+def build_key_pad_mask(
+    num_seqs: int,
+    aligned_len: int,
+    query_lens: list[int],
+    kv_lens: list[int],
+    num_kv_heads: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Additive key-pad row ``[B*KV, 1, 1, L]``: 0 where attend, ``-inf`` elsewhere.
+
+    Emits only the single key-pad row per sequence instead of the full
+    ``[B, 1, L, L]`` square that ``build_attention_mask`` produces. The same
+    row applies to every query position, so only the KV dimension needs
+    materialising. Avoids both the dense allocation and the ``host_key_pad_mask``
+    slice-and-reshape.
+    """
+    kv_len = torch.tensor(
+        [min(q, k) for q, k in zip(query_lens, kv_lens)],
+        dtype=torch.int32,
+    )
+    kv_pos = torch.arange(aligned_len, dtype=torch.int32)
+    neg_inf = torch.tensor(torch.finfo(dtype).min, dtype=dtype)
+    zeros = torch.zeros((), dtype=dtype)
+    # [B, 1, 1, L]
+    k_ok = (kv_pos.unsqueeze(0) < kv_len.unsqueeze(1)).unsqueeze(1).unsqueeze(1)
+    row = torch.where(k_ok, zeros, neg_inf)
+    # [B*KV, 1, 1, L]
+    return row.expand(num_seqs, num_kv_heads, 1, aligned_len).reshape(
+        num_seqs * num_kv_heads, 1, 1, aligned_len
+    ).contiguous()
 
 
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
