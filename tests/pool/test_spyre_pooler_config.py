@@ -367,9 +367,11 @@ def test_configure_pooling_installs_spyre_dispatch_pooler():
     assert type(model.pooler) is SpyreDispatchPooler
 
 
-@pytest.mark.skipif(not spyre_available(), reason="needs Spyre: the bypass is device-gated")
 def test_spyre_dispatch_pooler_keeps_hidden_states_bucketed():
     """Upstream slices to the real token count; the whole point is not to."""
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
     sub = _RecordingPooler()
     pooler = DispatchPooler({"embed": sub})
     pooler.__class__ = SpyreDispatchPooler
@@ -382,9 +384,11 @@ def test_spyre_dispatch_pooler_keeps_hidden_states_bucketed():
     assert len(out) == 1
 
 
-@pytest.mark.skipif(not spyre_available(), reason="needs Spyre: the bypass is device-gated")
 def test_spyre_dispatch_pooler_defers_to_upstream_for_mixed_tasks(monkeypatch):
     """Several groups need upstream's per-group offsets, so do not bypass."""
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
     called: list[bool] = []
 
     def fake_super_forward(self, hidden_states, pooling_metadata):
