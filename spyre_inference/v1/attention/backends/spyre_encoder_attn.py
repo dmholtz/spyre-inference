@@ -17,17 +17,10 @@
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
 layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
-Ragged→dense packing uses compiled ``index_copy_`` on Spyre into a
-slot-major workspace (decoder KV / torch-spyre#3705) so ``view(B, L, …)``
-is address-order-preserving. Default-layout ``view`` after ``index_copy_``
-scrambles B>1 (real-slot cosine ~0.07). Body-pad dests write an extra
-dummy row (not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1``
-with ``T == L`` and a full prompt compiles permute+SDPA (no ``attn_mask``).
-Any live pad uses packed QK: compile matmul only, eager pad add, compile P·V
-(Inductor ``matmul + mask`` → ``F.sdpa`` drops the mask; BGE cosine
-~0.46). Dest/mask use ``min(qsl, seq_lens, num_actual_tokens)``.
-Dest/unpack stay on host when ``T == L``. Pack tensors are built once
-per step.
+Instead of full-batch scatter-packing into [B, H, L, D] workspaces and gather-unpacking,
+the attention processes each sequence individually in a loop over B=1 sequences:
+each sequence's valid token slice is padded to its own stick/bucket length and executed
+with compiled B=1 masked/dense attention.
 """
 
 from __future__ import annotations
@@ -285,20 +278,20 @@ def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
     )
 
 
-@torch.compile()
-def _packed_masked_attention(
+def _b1_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     mask: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Scatter-path attention. Compile QK separately from mask + softmax + P·V.
+    """B=1 masked attention kernel for a single sequence with key-pad mask.
 
-    Compiling ``matmul + mask`` lets Inductor rewrite to ``F.sdpa``, which drops
-    ``attn_mask`` on Spyre -- so the mask must stay out of
-    the Q·Kᵀ graph. It does live in the P·V graph, which cannot form that
-    pattern; see ``_packed_pv``.
+    Shapes:
+      query: [1, hq, length, dim]
+      key:   [1, hkv, length, dim]
+      value: [1, hkv, length, dim]
+      mask:  [1 * hkv, 1, 1, length]
     """
     batch, hq, length, dim = query.shape
     hkv = key.shape[1]
@@ -312,13 +305,21 @@ def _packed_masked_attention(
     v = value.reshape(batch * hkv, 1, length, dim)
     scores = scores + mask
     scores_max = torch.amax(scores, dim=-1, keepdim=True)
-    # Dummy seqs (batch_bucket > num_seqs) have all-inf key_pad, so
-    # scores - scores_max is NaN. Decoder documents the same hazard where an
-    # in-graph store would publish it (spyre_attn mask_bs_bb[num_seqs:, 0]).
-    # Safe here: unpack only gathers orig_query_lens rows, never those seqs.
     probs = torch.exp(scores - scores_max)
     out = torch.matmul(probs, v) / probs.sum(dim=-1, keepdim=True)
     return out.reshape(batch, hkv * g, length, dim)
+
+
+@torch.compile()
+def _packed_masked_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Legacy packed attention (kept for reference/test compatibility)."""
+    return _b1_masked_attention(query, key, value, mask, scale)
 
 
 def _b1_dense_attention(
@@ -344,6 +345,83 @@ def _b1_dense_attention(
     if result.device.type == "spyre":
         result = convert(result, "cpu")
     return result[..., :head_size].contiguous()
+
+
+def _b1_seq_attention_staged(
+    q_full: torch.Tensor,
+    k_full: torch.Tensor,
+    v_full: torch.Tensor,
+    q_start: int,
+    real_len: int,
+    aligned_len: int,
+    key_pad_mask: torch.Tensor | None,
+    scale: float,
+    head_size_padded: int,
+    head_size: int,
+    q_staging: torch.Tensor,
+    k_staging: torch.Tensor,
+    v_staging: torch.Tensor,
+) -> torch.Tensor:
+    """Execute B=1 attention on a pre-allocated device staging scratchpad.
+
+    Copies `real_len` rows from `(q_full, k_full, v_full)` into `(q_staging, k_staging, v_staging)`,
+    zeros out any padding tokens up to `aligned_len`, executes the compiled SDPA/masked kernel,
+    and returns a clean `[real_len, H, head_size]` tensor with 0 host-device transfers.
+    """
+    hq = q_full.shape[1]
+    hkv = k_full.shape[1]
+
+    # Staging slice: [aligned_len, H, head_size_padded]
+    q_pad = q_staging[:aligned_len]
+    k_pad = k_staging[:aligned_len]
+    v_pad = v_staging[:aligned_len]
+
+    # Copy real tokens in place on device
+    q_pad[:real_len, :, :head_size].copy_(q_full[q_start : q_start + real_len])
+    k_pad[:real_len, :, :head_size].copy_(k_full[q_start : q_start + real_len])
+    v_pad[:real_len, :, :head_size].copy_(v_full[q_start : q_start + real_len])
+
+    # Zero pad tokens up to aligned_len
+    if aligned_len > real_len:
+        q_pad[real_len:aligned_len].zero_()
+        k_pad[real_len:aligned_len].zero_()
+        v_pad[real_len:aligned_len].zero_()
+
+    # Zero pad head dims if head_size_padded > head_size (e.g. MiniLM D=32)
+    if head_size_padded > head_size:
+        q_pad[:, :, head_size:head_size_padded].zero_()
+        k_pad[:, :, head_size:head_size_padded].zero_()
+        v_pad[:, :, head_size:head_size_padded].zero_()
+
+    if key_pad_mask is None:
+        kernel = _compile_if_spyre(
+            _b1_sdpa_kernel_gqa if hq != hkv else _b1_sdpa_kernel,
+            q_full.device.type,
+        )
+        out = _call_kernel("B=1 fused encoder SDPA", kernel, q_pad, k_pad, v_pad, scale)
+    else:
+        # 4D view: [1, H, L, D]
+        q_4d = q_pad.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+        k_4d = k_pad.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+        v_4d = v_pad.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+        kernel = _compile_if_spyre(_b1_masked_attention, q_full.device.type)
+        out_4d = _call_kernel(
+            "B=1 masked encoder SDPA",
+            kernel,
+            q_4d,
+            k_4d,
+            v_4d,
+            key_pad_mask,
+            scale,
+        )
+        out = out_4d.squeeze(0).permute(1, 0, 2).contiguous()
+
+    if out.shape[-1] != head_size:
+        if out.device.type == "spyre":
+            out = convert(out, "cpu")
+        out = out[..., :head_size].contiguous()
+
+    return out[:real_len]
 
 
 def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
@@ -603,7 +681,7 @@ def _ensure_encoder_pack(
     cached_max_model_len: int,
     cached_max_num_batched_tokens: int,
 ) -> None:
-    """Build scatter dest + unpack + key-pad once per step; later layers reuse them."""
+    """Build per-sequence metadata and key-pad masks once per step."""
     if attn_metadata.encoder_pack_batch is not None:
         return
 
@@ -615,10 +693,9 @@ def _ensure_encoder_pack(
     q_starts = q_starts[:num_seqs]
     qsl_lens = qsl_lens[:num_seqs]
     kv_lens = kv_lens[:num_seqs]
-    # Pick (B, L) from padded qsl/seq so identity T==L still matches the body
-    # bucket. Cap dest/mask with num_actual_tokens after that (BGE: both
-    # cu_seqlens and seq_lens can be the bucket).
-    max_len = max(_content_query_lens(qsl_lens, kv_lens), default=0)
+
+    query_lens = _content_query_lens(qsl_lens, kv_lens, num_actual_tokens=n)
+    max_len = max(query_lens, default=0)
     pair = pick_encoder_attention_shape(
         num_seqs,
         max_len,
@@ -631,61 +708,51 @@ def _ensure_encoder_pack(
         batch_bucket, aligned_len = pair
     else:
         batch_bucket, aligned_len = _ladder_encoder_shape(num_seqs, max_len, cached_max_model_len)
-    query_lens = _content_query_lens(qsl_lens, kv_lens, num_actual_tokens=n)
-    orig_q_starts = q_starts
-    orig_query_lens = query_lens
+
     fused = _is_b1_fused_sdpa(
         batch_bucket,
         padded_tokens,
         aligned_len,
-        orig_query_lens[0] if orig_query_lens else 0,
+        query_lens[0] if query_lens else 0,
     )
     if fused:
-        # No dest, unpack, or mask. Compiled SDPA has no attn_mask.
         attn_metadata.encoder_pack_batch = batch_bucket
         attn_metadata.encoder_pack_len = aligned_len
         attn_metadata.encoder_fused_sdpa = True
         return
-    if batch_bucket > num_seqs:
-        q_starts = q_starts + [n] * (batch_bucket - num_seqs)
-        query_lens = query_lens + [0] * (batch_bucket - num_seqs)
-        kv_lens = kv_lens + [0] * (batch_bucket - num_seqs)
 
-    dummy_row = batch_bucket * aligned_len
-    kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
-    q_dest = host_scatter_pack_dest(q_starts, query_lens, aligned_len, padded_tokens, dummy_row)
-    kv_dest = host_scatter_pack_dest(q_starts, kv_pack_lens, aligned_len, padded_tokens, dummy_row)
-    unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, padded_tokens)
-    mask_cpu = build_attention_mask(
-        batch_bucket,
-        aligned_len,
-        query_lens,
-        kv_lens,
-        dtype=query.dtype,
-        device=torch.device("cpu"),
-    )
-    key_pad = host_key_pad_mask(mask_cpu, num_kv_heads)
-    # Do not H2D ``mask_cpu`` ([B, 1, L, L]). Forward only needs (B, L) plus
-    # this key-pad; at B=8, L=512 the unused copy is ~4 MB fp16 per step.
-    if target_device.type == "spyre":
-        key_pad = convert(key_pad, target_device)
-    else:
-        key_pad = key_pad.to(target_device)
+    # Build per-sequence metadata with warmed length buckets
+    len_buckets_list = default_encoder_len_buckets(cached_max_model_len)
+    seq_info = []
+    for s in range(num_seqs):
+        q_start = q_starts[s]
+        real_len = query_lens[s]
+        seq_bucket_len = next_bucket(real_len, len_buckets_list)
+        if real_len == seq_bucket_len:
+            seq_key_pad = None
+        else:
+            mask_cpu = build_attention_mask(
+                1,
+                seq_bucket_len,
+                [real_len],
+                [real_len],
+                dtype=query.dtype,
+                device=torch.device("cpu"),
+            )
+            seq_key_pad = host_key_pad_mask(mask_cpu, num_kv_heads)
+            if target_device.type == "spyre":
+                seq_key_pad = convert(seq_key_pad, target_device)
+            else:
+                seq_key_pad = seq_key_pad.to(target_device)
+        seq_info.append((q_start, real_len, seq_bucket_len, seq_key_pad))
 
-    # B=1 T==L with live pad still identity-packs; dest/unpack stay on host.
-    b1_dense = _is_b1_dense_body(batch_bucket, padded_tokens, aligned_len)
-    if b1_dense:
-        attn_metadata.encoder_q_pack_idx = q_dest
-        attn_metadata.encoder_kv_pack_idx = kv_dest
-        attn_metadata.encoder_unpack_idx = unpack_idx
-    else:
-        attn_metadata.encoder_q_pack_idx = _indices_for_device(q_dest, target_device)
-        attn_metadata.encoder_kv_pack_idx = _indices_for_device(kv_dest, target_device)
-        attn_metadata.encoder_unpack_idx = _indices_for_device(unpack_idx, target_device)
+    attn_metadata.encoder_seq_info = seq_info
+    # Keep encoder_key_pad_mask and legacy attributes for compatibility/tests
+    if len(seq_info) == 1:
+        attn_metadata.encoder_key_pad_mask = seq_info[0][3]
     attn_metadata.encoder_pack_batch = batch_bucket
     attn_metadata.encoder_pack_len = aligned_len
     attn_metadata.encoder_fused_sdpa = False
-    attn_metadata.encoder_key_pad_mask = key_pad
 
 
 def build_attention_mask(
@@ -822,141 +889,156 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 head_size_padded,
                 head_size,
             )
-        else:
-            batch = attn_metadata.encoder_pack_batch
-            aligned_len = attn_metadata.encoder_pack_len
-            q_pack = attn_metadata.encoder_q_pack_idx
-            kv_pack = attn_metadata.encoder_kv_pack_idx
-            unpack_idx = attn_metadata.encoder_unpack_idx
-            key_pad_mask = attn_metadata.encoder_key_pad_mask
-            assert batch is not None and aligned_len is not None
-            assert q_pack is not None and kv_pack is not None and unpack_idx is not None
-            assert key_pad_mask is not None
-            rows = batch * aligned_len + 1
-            q_ws = _cached_encoder_workspace(
-                attn_metadata,
-                "encoder_q_workspace",
-                rows,
-                num_heads,
-                head_size_padded,
-                query.dtype,
-                query.device,
-            )
-            kv_ws = _cached_encoder_workspace(
-                attn_metadata,
-                "encoder_kv_workspace",
-                rows,
-                num_kv_heads,
-                head_size_padded,
-                key.dtype,
-                key.device,
-            )
-            v_ws = _cached_encoder_workspace(
-                attn_metadata,
-                "encoder_v_workspace",
-                rows,
-                num_kv_heads,
-                head_size_padded,
-                value.dtype,
-                value.device,
-            )
-            q_batched = scatter_pack(
-                query, q_pack, batch, aligned_len, head_size_padded, workspace=q_ws
-            )
-            k_batched = scatter_pack(
-                key, kv_pack, batch, aligned_len, head_size_padded, workspace=kv_ws
-            )
-            v_batched = scatter_pack(
-                value, kv_pack, batch, aligned_len, head_size_padded, workspace=v_ws
-            )
-            attn_out = _packed_masked_attention(
-                q_batched,
-                k_batched,
-                v_batched,
-                key_pad_mask,
-                scale,
-            )
-            result = gather_unpack(attn_out, unpack_idx, head_size)
-        if result.dtype != output.dtype:
-            result = convert(result, dtype=output.dtype)
+            if result.dtype != output.dtype:
+                result = convert(result, dtype=output.dtype)
 
-        # MiniLM D=32: flatten to [T, H*D] (384 = 6 sticks) so the write is aligned.
+            # MiniLM D=32: flatten to [T, H*D] (384 = 6 sticks) so the write is aligned.
+            use_flat_write = target_device.type == "spyre" and head_size % ENCODER_SEQ_ALIGNMENT != 0
+            if use_flat_write:
+                if result.device.type == "spyre":
+                    result = convert(result, "cpu")
+                src = convert(
+                    result.reshape(padded_tokens, -1).contiguous(), target_device.type, output.dtype
+                )
+                output.reshape(padded_tokens, -1).copy_(src)
+            else:
+                if result.device.type != output.device.type:
+                    result = convert(result, output.device)
+                output.copy_(result)
+            return output
+
+        seq_info = attn_metadata.encoder_seq_info
+        assert seq_info is not None
+
+        # Pre-allocated device staging buffers (allocated once on attn_metadata, 0 dynamic allocations)
+        q_ws = _cached_encoder_workspace(
+            attn_metadata,
+            "encoder_q_workspace",
+            self._cached_max_model_len,
+            num_heads,
+            head_size_padded,
+            query.dtype,
+            query.device,
+        )
+        k_ws = _cached_encoder_workspace(
+            attn_metadata,
+            "encoder_kv_workspace",
+            self._cached_max_model_len,
+            num_kv_heads,
+            head_size_padded,
+            key.dtype,
+            key.device,
+        )
+        v_ws = _cached_encoder_workspace(
+            attn_metadata,
+            "encoder_v_workspace",
+            self._cached_max_model_len,
+            num_kv_heads,
+            head_size_padded,
+            value.dtype,
+            value.device,
+        )
+
         use_flat_write = target_device.type == "spyre" and head_size % ENCODER_SEQ_ALIGNMENT != 0
-        if use_flat_write:
-            if result.device.type == "spyre":
-                result = convert(result, "cpu")
-            src = convert(
-                result.reshape(padded_tokens, -1).contiguous(), target_device.type, output.dtype
+        for q_start, real_len, seq_aligned_len, key_pad in seq_info:
+            out_slice = _b1_seq_attention_staged(
+                query,
+                key,
+                value,
+                q_start,
+                real_len,
+                seq_aligned_len,
+                key_pad,
+                scale,
+                head_size_padded,
+                head_size,
+                q_ws,
+                k_ws,
+                v_ws,
             )
-            output.reshape(padded_tokens, -1).copy_(src)
-        else:
-            if result.device.type != output.device.type:
-                result = convert(result, output.device)
-            output.copy_(result)
+            if out_slice.dtype != output.dtype:
+                out_slice = convert(out_slice, dtype=output.dtype)
+
+            if use_flat_write:
+                if out_slice.device.type == "spyre":
+                    out_slice = convert(out_slice, "cpu")
+                src = convert(
+                    out_slice.reshape(real_len, -1).contiguous(), target_device.type, output.dtype
+                )
+                output[q_start : q_start + real_len].reshape(real_len, -1).copy_(src)
+            else:
+                if out_slice.device.type != output.device.type:
+                    out_slice = convert(out_slice, output.device)
+                output[q_start : q_start + real_len].copy_(out_slice)
 
         return output
 
     def record_pack_graphs(self, device: torch.device) -> int:
-        """Trace ``scatter_pack`` on every ``reachable_pack_shapes`` triple.
+        """Trace B=1 attention kernels on all reachable length buckets.
 
-        Warmup's dummy runs reach the pack kernel at one body bucket per cell, leaving
-        most of its shape grid uncompiled. Tracing it needs no model forward, so the
-        whole grid is affordable here.
-
-        Returns the number of traces; a failure is logged and skipped, costing one lazy
-        compile rather than a dead engine.
+        Loops through each length bucket in default_encoder_len_buckets and records
+        both dense SDPA and masked SDPA.
         """
         if not self._compile_attn or device.type != "spyre":
             return 0
-        triples = reachable_pack_shapes(
-            self._cached_encoder_shapes,
-            self._cached_body_buckets,
-            self._cached_max_num_batched_tokens,
-        )
-        # Q packs with num_heads, K/V with num_kv_heads: one family under MHA, two GQA.
-        head_counts = sorted({self.num_heads, self.num_kv_heads})
+        lengths = default_encoder_len_buckets(self._cached_max_model_len)
+        head_size_padded = _align_up(self.head_size)
         recorded = 0
-        # The kernel sees B*L + 1 dest rows, not B and L, so equal-area cells share one.
-        seen: set[tuple[int, int]] = set()
-        for batch, aligned_len, num_src in triples:
-            if (batch * aligned_len, num_src) in seen:
-                continue
-            seen.add((batch * aligned_len, num_src))
-            # Values never reach the guards but must stay in range: a wide cell at a
-            # small body bucket has fewer source rows than sequences, so fill what fits.
-            per_seq = min(aligned_len, max(1, num_src // batch))
-            filled = min(batch, num_src // per_seq)
-            dest = _indices_for_device(
-                host_scatter_pack_dest(
-                    [seq * per_seq for seq in range(filled)],
-                    [per_seq] * filled,
-                    aligned_len,
-                    num_src,
-                    batch * aligned_len,
-                ),
+        for length in lengths:
+            q_padded = convert(
+                torch.zeros(length, self.num_heads, head_size_padded, dtype=self.model_dtype),
                 device,
             )
-            for num_heads in head_counts:
-                # Unpadded head size so _pad_head_dim_to_stick runs as in forward --
-                # the traced layout must match the one serving hands the kernel.
-                flat = convert(
-                    torch.zeros(num_src, num_heads, self.head_size, dtype=self.model_dtype),
-                    device,
+            k_padded = convert(
+                torch.zeros(length, self.num_kv_heads, head_size_padded, dtype=self.model_dtype),
+                device,
+            )
+            v_padded = convert(
+                torch.zeros(length, self.num_kv_heads, head_size_padded, dtype=self.model_dtype),
+                device,
+            )
+            # Trace dense SDPA
+            try:
+                kernel = _compile_if_spyre(
+                    _b1_sdpa_kernel_gqa if self.num_heads != self.num_kv_heads else _b1_sdpa_kernel,
+                    device.type,
                 )
-                try:
-                    scatter_pack(flat, dest, batch, aligned_len, _align_up(self.head_size))
-                except Exception:
-                    logger.warning(
-                        "Encoder pack graph (B=%d, L=%d, src=%d, H=%d) failed to record; "
-                        "it will compile on first use instead.",
-                        batch,
-                        aligned_len,
-                        num_src,
-                        num_heads,
-                        exc_info=True,
-                    )
-                    continue
+                _call_kernel("B=1 fused encoder SDPA", kernel, q_padded, k_padded, v_padded, self.scale)
                 recorded += 1
+            except Exception:
+                logger.warning(
+                    "B=1 dense encoder SDPA (L=%d) failed to record.",
+                    length,
+                    exc_info=True,
+                )
+
+            # Trace masked SDPA
+            try:
+                mask_cpu = build_attention_mask(
+                    1, length, [length // 2 or 1], [length // 2 or 1], dtype=self.model_dtype, device="cpu"
+                )
+                key_pad = host_key_pad_mask(mask_cpu, self.num_kv_heads)
+                key_pad = convert(key_pad, device)
+                q_4d = q_padded.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+                k_4d = k_padded.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+                v_4d = v_padded.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+                kernel_masked = _compile_if_spyre(_b1_masked_attention, device.type)
+                _call_kernel(
+                    "B=1 masked encoder SDPA",
+                    kernel_masked,
+                    q_4d,
+                    k_4d,
+                    v_4d,
+                    key_pad,
+                    self.scale,
+                )
+                recorded += 1
+            except Exception:
+                logger.warning(
+                    "B=1 masked encoder SDPA (L=%d) failed to record.",
+                    length,
+                    exc_info=True,
+                )
         return recorded
 
 

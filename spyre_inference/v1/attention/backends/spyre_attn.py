@@ -326,22 +326,16 @@ class SpyreAttentionMetadata(AttentionMetadata):
     encoder_q_pack_idx: torch.Tensor | None = None
     encoder_kv_pack_idx: torch.Tensor | None = None
     encoder_unpack_idx: torch.Tensor | None = None
+    # Per-sequence metadata list of (q_start, real_len, seq_aligned_len, seq_key_pad)
+    encoder_seq_info: list[tuple[int, int, int, torch.Tensor | None]] | None = None
     # Packed SDPA grid. ``None`` until layer 0; fused B=1 still sets these so
-    # later layers skip rebuild. Do not H2D a ``[B, 1, L, L]`` mask — forward
-    # only needs this pair plus ``encoder_key_pad_mask``.
+    # later layers skip rebuild.
     encoder_pack_batch: int | None = None
     encoder_pack_len: int | None = None
     encoder_fused_sdpa: bool = False
-    # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device. ``None`` on
-    # the fused path. Broadcast onto encoder scores ``[BH, G, L, L]`` by the
-    # compiled add in ``_packed_pv``; a dense ``[BH, 1, L, L]`` was needed only
-    # while that add was eager.
+    # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device.
     encoder_key_pad_mask: torch.Tensor | None = None
-    # Slot-major scatter scratch ``[B*L+1, H, D]``. Alloc once per step; ``zero_``
-    # before each pack so pad slots stay empty. K and V must not share a buffer:
-    # at ``Hkv == 1`` ``permute.contiguous`` is a no-op view, so packing V into
-    # K's workspace would silently overwrite ``k_batched``. Q still differs
-    # under GQA.
+    # Slot-major scatter scratch ``[B*L+1, H, D]``.
     encoder_q_workspace: torch.Tensor | None = None
     encoder_kv_workspace: torch.Tensor | None = None
     encoder_v_workspace: torch.Tensor | None = None
