@@ -439,16 +439,19 @@ def scatter_pack(
 ) -> torch.Tensor:
     """Pack varlen ``[T, H, D]`` → ``[B, H, L, Dp]`` via compiled ``index_copy_``.
 
-    ``dest_idx`` is ``[T]`` packed-row ids (host or device). Pad slots stay
-    zeros. Body-pad dests write an extra dummy row (``B×L``), not CLS.
+    ``dest_idx`` is ``[T]`` packed-row ids (host or device). Body-pad dests
+    write an extra dummy row (``B×L``), not CLS.
 
     ``B=1`` with ``T == L`` skips ``index_copy_``: the runner already padded
     the body to the SDPA length. The attention mask hides leftover pad tokens.
 
     Spyre workspace is slot-major so ``view(B, L, …)`` splits an outermost
     dim (decoder KV). Default-layout ``view`` after ``index_copy_`` scrambles
-    ``B>1``. Serve caches ``workspace`` on the step and ``zero_``s it here so
-    pad slots from the previous pack do not leak.
+    ``B>1``. Serve caches ``workspace`` on the step; stale pad-slot values
+    from the previous pack are harmless because the key-pad mask makes K pad
+    columns contribute zero probability, Q pad rows are never gathered by
+    unpack, and dummy-sequence rows (batch_bucket > num_seqs) are also never
+    gathered.
 
     ``permute.contiguous`` does **not** copy when ``H == 1`` (size-1 dim is
     ignored by ``is_contiguous``). If the result still aliases ``workspace``,
@@ -479,8 +482,6 @@ def scatter_pack(
             flat.dtype,
             flat.device,
         )
-    else:
-        workspace.zero_()
     _index_copy(workspace, _dest_on_flat_device(dest_idx, flat), flat)
     packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
     packed = packed.permute(0, 2, 1, 3).contiguous()
