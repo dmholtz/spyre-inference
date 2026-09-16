@@ -337,13 +337,11 @@ def _packed_masked_attention(
     the Q·Kᵀ graph. It does live in the P·V graph, which cannot form that
     pattern; see ``_packed_pv``.
     """
-    device_type = query.device.type
-    qk = _compile_if_spyre(_packed_qk_matmul, device_type)
-    pv = _compile_if_spyre(_packed_pv, device_type)
-    # No eager expand: the mask is ``[B*KV, 1, 1, L]`` and the compiled add in
-    # ``pv`` broadcasts both the GQA head axis and the query axis.
-    scores = _call_kernel("packed encoder QK", qk, query, key, scale)
-    return _call_kernel("packed encoder P.V", pv, scores, mask, value)
+    # device_type = query.device.type
+    # qk = _compile_if_spyre(_packed_qk_matmul, device_type)
+    # pv = _compile_if_spyre(_packed_pv, device_type)
+    scores = _packed_qk_matmul(query, key, scale)
+    return _packed_pv(scores, mask, value)
 
 
 def _b1_dense_attention(
