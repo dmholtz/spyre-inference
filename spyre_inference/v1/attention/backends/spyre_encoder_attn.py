@@ -543,6 +543,37 @@ def gather_unpack(
     return gathered[..., :head_size].contiguous()
 
 
+def scatter_pack_hidden(
+    hidden: torch.Tensor,
+    dest_idx: torch.Tensor,
+    batch: int,
+    aligned_len: int,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pack varlen ``[T, hidden]`` -> ``[B, L, hidden]`` via ``scatter_pack``.
+
+    Treats hidden as a single-head tensor ``[T, 1, hidden]``, delegates to
+    ``scatter_pack``, and squeezes the head dim back out. The output is
+    ``[B, L, hidden]`` and always contiguous.
+
+    ``hidden_size`` is already a multiple of 64 (num_heads x head_size, both
+    stick-aligned), so no head-dim padding is needed.
+
+    ``B=1`` with ``T == L`` fast-paths to a reshape, same as ``scatter_pack``.
+    """
+    hidden_size = hidden.shape[-1]
+    packed_4d = scatter_pack(
+        hidden.unsqueeze(1),  # [T, 1, hidden_size]
+        dest_idx,
+        batch,
+        aligned_len,
+        hidden_size,  # already stick-aligned; _pad_head_dim_to_stick is a no-op
+        workspace=workspace,
+    )
+    # packed_4d is [B, 1, L, hidden_size]; squeeze H=1 dim.
+    return packed_4d.squeeze(1)  # [B, L, hidden_size]
+
+
 def _indices_for_device(indices: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Move pack dest / unpack indices onto ``device`` once.
 
