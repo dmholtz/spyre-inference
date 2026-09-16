@@ -31,6 +31,7 @@ from vllm.model_executor.models.bert import (
     BertSpladeSparseEmbeddingModel,
 )
 
+from spyre_inference.custom_ops.linear import spyre_linear_t
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
@@ -145,37 +146,53 @@ class SpyreBertSelfAttention(BertSelfAttention):
         aligned_len = attn_metadata.encoder_pack_len
         assert batch is not None and aligned_len is not None
 
-        # One scatter of hidden_states [T, hidden] → [B, L, hidden].
+        # One scatter of hidden_states [T, hidden] → [B*L, hidden].
+        # hs_flat is 2D so spyre_linear_t can matmul it without the 3D reshape
+        # workaround (torch-spyre#4155).
         rows = batch * aligned_len + 1
         hs_ws = _cached_encoder_workspace(
             attn_metadata,
             "encoder_hs_workspace",
             rows,
-            1,           # num_heads=1 (hidden is unsqueezed inside scatter_pack_hidden)
+            1,
             hidden_size,
             hidden_states.dtype,
             target_device,
         )
         hs_packed = scatter_pack_hidden(
             hidden_states,
-            attn_metadata.encoder_q_pack_idx,  # same dest as Q (same token positions)
+            attn_metadata.encoder_q_pack_idx,
             batch,
             aligned_len,
             workspace=hs_ws,
         )  # [B, L, hidden_size]
+        hs_flat = hs_packed.reshape(batch * aligned_len, hidden_size)  # [B*L, hidden] — zero-copy view
 
-        # QKV projection on the packed, uniform layout.
-        hs_flat = hs_packed.reshape(batch * aligned_len, hidden_size)
-        qkv_packed, _ = self.qkv_proj(hs_flat)  # [B*L, (Hq+2*Hkv)*D]
-        q_packed, k_packed, v_packed = qkv_packed.split(
-            [self.q_size, self.kv_size, self.kv_size], dim=-1
-        )
-        # split() returns strided views with stride[0] == qkv_width (not slice width),
-        # so reshape to 4D always copies. These are sequential copies (O(B*L*H*D)
-        # bandwidth) — cheaper than the indexed scatter they replaced, but still 3 copies.
-        q4 = q_packed.reshape(batch, aligned_len, self.num_heads,    self.head_dim).permute(0, 2, 1, 3)
-        k4 = k_packed.reshape(batch, aligned_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-        v4 = v_packed.reshape(batch, aligned_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        # Three separate projections on the packed 2D input.
+        # On Spyre, qkv_proj.weight is stored as Wᵀ [hidden, (Hq+2Hkv)*D] by
+        # SpyreTransposedWeightMethod, so the forward is x @ W (not F.linear's x @ Wᵀ).
+        # Column-slicing Wᵀ is zero-copy and contiguous, so each output
+        # [B*L, H*D] can be viewed to [B*L, H, D] → [B, L, H, D] without a copy.
+        weight_t = self.qkv_proj.weight  # [hidden, (Hq+2Hkv)*D], Wᵀ on Spyre
+        bias = self.qkv_proj.bias        # [(Hq+2Hkv)*D] or None
+        q_w = weight_t[:, : self.q_size]
+        k_w = weight_t[:, self.q_size : self.q_size + self.kv_size]
+        v_w = weight_t[:, self.q_size + self.kv_size :]
+        q_b = bias[: self.q_size] if bias is not None else None
+        k_b = bias[self.q_size : self.q_size + self.kv_size] if bias is not None else None
+        v_b = bias[self.q_size + self.kv_size :] if bias is not None else None
+
+        # spyre_linear_t: x @ weight_t (+ bias). Each output is a fresh contiguous
+        # [B*L, H*D] tensor, so the subsequent view to [B*L, H, D] is zero-copy.
+        q_flat = spyre_linear_t(hs_flat, q_w, q_b)  # [B*L, Hq*D]
+        k_flat = spyre_linear_t(hs_flat, k_w, k_b)  # [B*L, Hkv*D]
+        v_flat = spyre_linear_t(hs_flat, v_w, v_b)  # [B*L, Hkv*D]
+
+        # view to [B, L, H, D] is zero-copy (each output is contiguous [B*L, H*D]).
+        q4 = q_flat.view(batch, aligned_len, self.num_heads,    self.head_dim).permute(0, 2, 1, 3)
+        k4 = k_flat.view(batch, aligned_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v4 = v_flat.view(batch, aligned_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        # q4/k4/v4 are [B, H, L, D] — non-contiguous views, no copy.
 
         key_pad_mask = attn_metadata.encoder_key_pad_mask
         assert key_pad_mask is not None
