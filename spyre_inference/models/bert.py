@@ -166,15 +166,16 @@ class SpyreBertSelfAttention(BertSelfAttention):
 
         # QKV projection on the packed, uniform layout.
         hs_flat = hs_packed.reshape(batch * aligned_len, hidden_size)
-        qkv_packed, _ = self.qkv_proj(hs_flat)  # [B*L, q+k+v]
+        qkv_packed, _ = self.qkv_proj(hs_flat)  # [B*L, (Hq+2*Hkv)*D]
         q_packed, k_packed, v_packed = qkv_packed.split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
-        # split() views are strided; reshape() materialises dense [B, H, L, D] copies.
-        q4 = q_packed.reshape(batch, aligned_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # split() returns strided views with stride[0] == qkv_width (not slice width),
+        # so reshape to 4D always copies. These are sequential copies (O(B*L*H*D)
+        # bandwidth) — cheaper than the indexed scatter they replaced, but still 3 copies.
+        q4 = q_packed.reshape(batch, aligned_len, self.num_heads,    self.head_dim).permute(0, 2, 1, 3)
         k4 = k_packed.reshape(batch, aligned_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
         v4 = v_packed.reshape(batch, aligned_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-        # q4/k4/v4 are [B, H, L, D] — the shape _packed_masked_attention expects.
 
         key_pad_mask = attn_metadata.encoder_key_pad_mask
         assert key_pad_mask is not None
