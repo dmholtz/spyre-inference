@@ -322,7 +322,7 @@ def _packed_pv(scores: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) ->
     out = torch.matmul(probs, v) / probs.sum(dim=-1, keepdim=True)
     return out.reshape(batch, hkv * g, length, dim)
 
-
+@torch.compile()
 def _packed_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
