@@ -516,7 +516,7 @@ def reachable_pack_shapes(
                 triples.add((batch, aligned_len, num_src))
     return sorted(triples)
 
-
+@torch.compile
 def gather_unpack(
     attn_out: torch.Tensor,
     unpack_indices: torch.Tensor,
