@@ -4,7 +4,7 @@
 import pytest
 
 from spyre_inference.v1.sample.async_ring_buffer import (
-    AsyncExponential_RingBuffer,
+    AsyncExponential_Log_RingBuffer,
     AsyncRingBuffer,
     _AsyncCounterRingBuffer,
 )
@@ -78,7 +78,7 @@ class TestAsyncRingBuffer:
     def test_exponential_shape(self):
         """AsyncExponentialRingBuffer returns correctly shaped tensors."""
         V, B = 16, 4
-        buf = AsyncExponential_RingBuffer(vocab_size=V, max_batch_size=B)
+        buf = AsyncExponential_Log_RingBuffer(vocab_size=V, max_batch_size=B)
         try:
             for b in [1, 2, B]:
                 with buf.borrow_rows(b) as rows:
@@ -89,7 +89,7 @@ class TestAsyncRingBuffer:
     def test_borrow_is_zero_copy(self):
         """borrow_rows must yield a view into the backing buffer, not a copy."""
         V, B = 8, 4
-        buf = AsyncExponential_RingBuffer(vocab_size=V, max_batch_size=B)
+        buf = AsyncExponential_Log_RingBuffer(vocab_size=V, max_batch_size=B)
         try:
             with buf.borrow_rows(B) as rows:
                 assert rows.untyped_storage().data_ptr() == buf._buf.untyped_storage().data_ptr()
@@ -99,7 +99,7 @@ class TestAsyncRingBuffer:
     def test_borrow_out_of_bounds(self):
         """borrow_rows must raise a ValueError when n is outside the valid range."""
         V, B = 8, 4
-        buf = AsyncExponential_RingBuffer(vocab_size=V, max_batch_size=B)
+        buf = AsyncExponential_Log_RingBuffer(vocab_size=V, max_batch_size=B)
         try:
             with pytest.raises(ValueError, match="n.*must satisfy"), buf.borrow_rows(B + 1):
                 pass
@@ -121,7 +121,7 @@ class TestAsyncRingBuffer:
 
     def test_stop_joins_thread(self):
         """stop() must cause the background thread to finish."""
-        buf = AsyncExponential_RingBuffer(vocab_size=4, max_batch_size=2)
+        buf = AsyncExponential_Log_RingBuffer(vocab_size=4, max_batch_size=2)
         assert buf._thread.is_alive()
         buf.shutdown()
         assert not buf._thread.is_alive()

@@ -152,7 +152,7 @@ class AsyncRingBuffer(ABC):
         self._thread.join()
 
 
-class AsyncExponential_RingBuffer(AsyncRingBuffer):
+class AsyncExponential_Log_RingBuffer(AsyncRingBuffer):
     """Ring buffer that pre-generates exponential log noise via ``exponential_().log_()``."""
 
     def _refill_slice(self, start: int, end: int) -> None:

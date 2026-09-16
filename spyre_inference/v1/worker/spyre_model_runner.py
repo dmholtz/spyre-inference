@@ -508,7 +508,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Sort-free top-k path (see SpyreTopKTopPSampler).
         self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
-            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
+            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel, vllm_config=vllm_config
         )
 
         # Disable GPU-specific features (same as CPUModelRunner)
@@ -1268,6 +1268,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             model = model._orig_mod
         assert isinstance(model, nn.Module)
         return model
+
+    def shutdown(self) -> None:
+        if isinstance(self.sampler.topk_topp_sampler, SpyreTopKTopPSampler):
+            self.sampler.topk_topp_sampler.shutdown()
+        super().shutdown()
 
     # --- Buffer management ---
 
