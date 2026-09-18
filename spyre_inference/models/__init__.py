@@ -46,6 +46,11 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
     ),
+    # So that ``model_impl="transformers --runner pooling`` uses the
+    # hf_adapters-backed encoder path instead of the vLLM attention shim.
+    "TransformersEmbeddingModel": (
+        "spyre_inference.transformers_pooling:SpyreTransformersEmbeddingModel"
+    ),
 }
 
 
