@@ -36,7 +36,10 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -189,22 +192,20 @@ def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.M
         cfg.head_dim = padded
 
 
-class SpyreTransformersForCausalLM(TransformersForCausalLM):
-    """Transformers backend with the Spyre RoPE replacement wired in."""
+class _SpyreTransformersMixin:
+    """Shared Spyre adaptations for all Transformers-backend model variants.
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        self._fix_generic_config(vllm_config)
-        self._max_position = vllm_config.model_config.max_model_len
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        logger.debug("SpyreTransformersForCausalLM ready: %s", type(self.model).__name__)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
-        self._patch_rope()
-        return result
+    Provides:
+    - ``_fix_generic_config``: re-resolves a bare ``PretrainedConfig`` produced when
+      the Mistral parser encounters repos shipping both ``config.json`` and
+      ``params.json``, and forces HF-format weight loading.
+    - ``_patch_rope``: replaces HF's ``rotary_emb`` module and the module-level
+      ``apply_rotary_pos_emb`` with Spyre-friendly matmul-only equivalents.
+      No-ops gracefully on encoder-only models that have no rotary embedding.
+    """
 
     @staticmethod
-    def _fix_generic_config(vllm_config: VllmConfig) -> None:
+    def _fix_generic_config(vllm_config: "VllmConfig") -> None:
         """Re-resolve the bare PretrainedConfig that vLLM's Mistral parser produces for
         repos shipping both config.json and params.json, which AutoModel.from_config
         rejects, and force HF-format weight loading. ``--config-format hf`` skips it."""
@@ -241,6 +242,10 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
     def _patch_rope(self):
         """Swap HF's rotary embedding and ``apply_rotary_pos_emb`` for the Spyre ones.
 
+        Encoder-only models (BERT, RoBERTa, ...) have no ``rotary_emb`` — the patch
+        is a no-op for them.  Decoder-style embedding models (e.g. Granite embedding)
+        carry a ``rotary_emb`` and are patched normally.
+
         Partial rotary dimensions (e.g. Phi-3) are unsupported — the cache would cover
         only the rotated dims — but reach a shape mismatch here rather than a check:
         ``_maybe_pad_head_dim`` already rejects them whenever padding is needed.
@@ -252,10 +257,15 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         backbone = cast(nn.Module, getattr(inner, "language_model", inner))
         cfg = getattr(backbone, "config", self.model.config)
 
+        try:
+            rope_source = backbone.get_submodule("rotary_emb")
+        except AttributeError:
+            # Encoder-only models (BERT, RoBERTa, ...) have no rotary embedding.
+            return
+
         # head_dim is already stick-aligned (the platform pads it, and the weight pass
         # pads Q/K interleaved to match), so the rotation only needs the pre-pad
         # frequencies identity-padded back out to the widened width.
-        rope_source = backbone.get_submodule("rotary_emb")
         orig_head_dim = original_head_dim(cfg)
         padded_head_dim = None
         if orig_head_dim is not None:
@@ -301,6 +311,44 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
             patched_mods.add(id(mod))
 
 
+class SpyreTransformersForCausalLM(_SpyreTransformersMixin, TransformersForCausalLM):
+    """Transformers backend with the Spyre RoPE replacement wired in."""
+
+    def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):
+        self._fix_generic_config(vllm_config)
+        self._max_position = vllm_config.model_config.max_model_len
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        logger.debug("SpyreTransformersForCausalLM ready: %s", type(self.model).__name__)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        self._patch_rope()
+        return result
+
+
+class SpyreTransformersEmbeddingModel(_SpyreTransformersMixin, TransformersEmbeddingModel):
+    """Transformers embedding backend with the Spyre RoPE replacement wired in.
+
+    Handles both encoder-only models (BERT, RoBERTa — no RoPE, patch is a no-op)
+    and decoder-style embedding models (e.g. Granite embedding — RoPE patched).
+    """
+
+    def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):
+        self._fix_generic_config(vllm_config)
+        self._max_position = vllm_config.model_config.max_model_len
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        logger.debug(
+            "SpyreTransformersEmbeddingModel ready: %s", type(self.model).__name__
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        self._patch_rope()
+        return result
+
+
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
-# against "TransformersForCausalLM", so the subclass has to keep answering to that name.
+# against "TransformersForCausalLM" / "TransformersEmbeddingModel", so the subclasses must
+# keep answering to those names.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
+SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"

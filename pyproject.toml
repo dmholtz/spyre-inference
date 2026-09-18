@@ -12,6 +12,8 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre[cpsat]",
+    "hf_adapters",
+    "sentence-transformers",
     "vllm>=0.28.0,<0.29",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index

@@ -34,12 +34,17 @@ def register():
 
 
 def register_ops():
-    """Register the Spyre OOT custom ops and model adaptations."""
+    """Register the Spyre OOT custom ops, model adaptations, and custom loaders."""
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
+    from spyre_inference.st_model_loader import SpyreSentenceTransformerLoader
 
     register_all()
     register_models()
+
+    from vllm.model_executor.model_loader import register_model_loader
+
+    register_model_loader("spyre_st")(SpyreSentenceTransformerLoader)
 
 
 def _init_logging():
