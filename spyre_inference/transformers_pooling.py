@@ -154,9 +154,11 @@ class SpyreTransformersEmbeddingModel(nn.Module, VllmModelForPooling):
         # (CLS/LAST row indices, MEAN token ranges) works on the packed layout.
         return last_hidden.reshape(-1, last_hidden.shape[-1])[: int(positions.shape[0])]
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         # Weights are already loaded by AutoSpyreModel.from_pretrained in __init__.
-        return set()
+        # Return None so the loader skips its weight-coverage check (line 437 in
+        # default_loader.py: ``loaded_weights is not None`` gates track_weights_loading).
+        pass
 
     def make_empty_intermediate_tensors(self, *args, **kwargs) -> IntermediateTensors:
         raise NotImplementedError(
