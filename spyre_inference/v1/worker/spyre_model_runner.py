@@ -536,6 +536,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _init_model_kwargs can inject it into the model's forward kwargs.
         self._num_scheduled_tokens: int = 0
 
+        # Pre-shaped [B_bucketed, L_max] tensors built in _prepare_inputs for
+        # pooling models; injected into model_kwargs so forward() skips _rebatch.
+        self._encoder_batched_ids: torch.Tensor | None = None
+        self._encoder_attention_mask: torch.Tensor | None = None
+        self._encoder_batch_size: int = 0  # real (un-bucketed) sequence count
+
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
         # Spyre doesn't support all dtypes (int32, bool) natively.
@@ -1079,10 +1085,62 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
+    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens_np):
+        """Run the standard flat-gather path, then for pooling models also build
+        the pre-shaped ``[B_bucketed, L_max]`` encoder inputs from the 2D
+        ``token_ids_cpu_tensor`` buffer.  This avoids a second scatter in
+        ``_rebatch`` inside ``forward()``.
+        """
+        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+
+        if self.model_config.runner_type != "pooling":
+            return result
+
+        from spyre_inference.transformers_pooling import _BLOCK_SIZE, _next_power_of_two
+
+        num_reqs = self.input_batch.num_reqs
+        # per-request real token counts (num_computed_tokens == 0 for fresh prefills)
+        seq_lens = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens_np
+        ).tolist()
+
+        batch_size = num_reqs
+        batch_bucketed = _next_power_of_two(batch_size)
+        max_real_len = int(max(seq_lens))
+        max_len = ((max_real_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE
+
+        # Slice directly from the 2D [max_num_reqs, max_model_len] buffer —
+        # no index_select needed; tokens are already right-padded per row.
+        src = self.input_batch.token_ids_cpu_tensor  # [max_num_reqs, max_model_len]
+        batched = torch.zeros((batch_bucketed, max_len), dtype=torch.int64)
+        mask = torch.zeros((batch_bucketed, max_len), dtype=torch.long)
+        for i, slen in enumerate(seq_lens):
+            batched[i, :slen] = src[i, :slen].to(torch.int64)
+            mask[i, :slen] = 1
+
+        self._encoder_batched_ids = batched
+        self._encoder_attention_mask = mask
+        self._encoder_batch_size = batch_size
+        logger.debug(
+            "encoder pre-shape: %d seqs → [%d, %d] (B_real=%d)",
+            batch_size, batch_bucketed, max_len, batch_size,
+        )
+        return result
+
     def _init_model_kwargs(self) -> dict:
         kwargs = super()._init_model_kwargs()
         if self.model_config.runner_type == "pooling":
             kwargs["num_scheduled_tokens"] = self._num_scheduled_tokens
+            if self._encoder_batched_ids is not None:
+                kwargs["encoder_batched_ids"] = self._encoder_batched_ids
+                kwargs["encoder_attention_mask"] = self._encoder_attention_mask
+                kwargs["encoder_batch_size"] = self._encoder_batch_size
+                # Reset so a dummy run that doesn't call _prepare_inputs won't
+                # carry stale tensors forward.
+                self._encoder_batched_ids = None
+                self._encoder_attention_mask = None
+                self._encoder_batch_size = 0
         return kwargs
 
     def _warmup_pooling_bucket_shapes(self) -> None:

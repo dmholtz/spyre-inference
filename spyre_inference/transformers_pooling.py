@@ -165,10 +165,18 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        num_real_tokens: int = kwargs.get("num_scheduled_tokens", 0) or int(positions.shape[0])
-        batched_ids, attention_mask, batch_size = _rebatch(
-            input_ids.cpu(), positions.cpu(), num_real_tokens, pad_id=self._pad_token_id
-        )
+        # Fast path: runner pre-shaped the inputs in _prepare_inputs, no rebatch needed.
+        batched_ids = kwargs.get("encoder_batched_ids")
+        attention_mask = kwargs.get("encoder_attention_mask")
+        batch_size = kwargs.get("encoder_batch_size", 0)
+
+        if batched_ids is None:
+            # Fallback for dummy/warmup runs and direct forward() calls without runner.
+            num_real_tokens: int = kwargs.get("num_scheduled_tokens", 0) or int(positions.shape[0])
+            batched_ids, attention_mask, batch_size = _rebatch(
+                input_ids.cpu(), positions.cpu(), num_real_tokens, pad_id=self._pad_token_id
+            )
+
         # prefill_encoder returns [B_bucketed, L_max, H] on Spyre.
         last_hidden = self._prefill_encoder(
             self._run_backbone_forward,
