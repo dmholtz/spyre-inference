@@ -73,6 +73,9 @@ def _seq_lengths_from_positions(positions: torch.Tensor) -> list[int]:
     return lengths
 
 
+_BLOCK_SIZE = 64  # Spyre stick size (128 bytes / 2 bytes per fp16 element)
+
+
 def _rebatch(
     input_ids: torch.Tensor,
     seq_lengths: list[int],
@@ -80,11 +83,17 @@ def _rebatch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack flat ``input_ids [T]`` into ``[B, L_max]`` with right-padding.
 
+    ``L_max`` is rounded up to the next multiple of ``_BLOCK_SIZE`` so that
+    ``prefill_encoder``'s internal block-pad is always a no-op.  This keeps the
+    sequence-length dimension constant across calls with the same maximum real
+    length, avoiding repeated recompiles when the batch size varies.
+
     Returns ``(batched_ids, attention_mask)`` both on CPU, mirroring the
     layout that ``prefill_encoder`` expects.
     """
     batch_size = len(seq_lengths)
-    max_len = max(seq_lengths)
+    raw_max = max(seq_lengths)
+    max_len = ((raw_max + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE
     batched = torch.full((batch_size, max_len), pad_id, dtype=input_ids.dtype)
     mask = torch.zeros((batch_size, max_len), dtype=torch.long)
     offset = 0
@@ -143,6 +152,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         **kwargs,
     ) -> torch.Tensor:
         seq_lengths = _seq_lengths_from_positions(positions)
+        print("Running forward with", seq_lengths)
         batched_ids, attention_mask = _rebatch(
             input_ids.cpu(), seq_lengths, pad_id=self._pad_token_id
         )
