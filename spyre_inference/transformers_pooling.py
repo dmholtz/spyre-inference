@@ -167,9 +167,22 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
             batched_ids,
             attention_mask,
         )
-        # Flatten back to [T, H] so the downstream pooler's cursor arithmetic
-        # (CLS/LAST row indices, MEAN token ranges) works on the packed layout.
-        return last_hidden.reshape(-1, last_hidden.shape[-1])[: int(positions.shape[0])]
+        # Flatten [B, L, H] → [B*L, H] and crop to the real token count.
+        # During dummy/warmup runs the positions buffer is all zeros so _rebatch
+        # produces fewer rows (B=1, L=64) than num_tokens_padded.  Pad with zeros
+        # so that upstream's logit_indices can always index into a full-sized
+        # [num_tokens_padded, H] tensor without going out of bounds.
+        flat = last_hidden.reshape(-1, last_hidden.shape[-1])
+        num_tokens_padded = int(positions.shape[0])
+        if flat.shape[0] < num_tokens_padded:
+            pad = torch.zeros(
+                num_tokens_padded - flat.shape[0],
+                flat.shape[1],
+                dtype=flat.dtype,
+                device=flat.device,
+            )
+            flat = torch.cat([flat, pad], dim=0)
+        return flat[:num_tokens_padded]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         # Weights are already loaded by AutoSpyreModel.from_pretrained in __init__.
