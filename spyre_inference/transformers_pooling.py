@@ -64,6 +64,54 @@ def _next_power_of_two(n: int) -> int:
     return p
 
 
+def _build_encoder_inputs(
+    batched_ids: torch.Tensor,   # [B_bucketed, L]  int64  CPU — already block-aligned
+    seq_lens: list[int],         # real token count per row; len == B_real <= B_bucketed
+    model_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build position_ids, tt_ids, and the SDPA additive mask on CPU.
+
+    Replaces the preparation work inside ``prefill_encoder`` without
+    redundant copies or Python-per-row loops where avoidable.
+
+    Returns:
+        position_ids  [B_bucketed, L]  int64  CPU
+        tt_ids        [B_bucketed, L]  int64  CPU  (all-zero; moved to Spyre by wrapper)
+        sdpa_mask     [B_bucketed, 1, L, L]  model_dtype  CPU
+    """
+    B_bucketed, L = batched_ids.shape
+    B_real = len(seq_lens)
+
+    # --- position_ids --------------------------------------------------
+    # col < seq_len[b] selects real positions; multiply by col gives 0..L-1
+    # for real tokens and 0 for pads (col[0]*True = 0 is correct for pos 0).
+    col = torch.arange(L, dtype=torch.int64)           # [L]
+    sl  = torch.tensor(seq_lens, dtype=torch.int64)    # [B_real]
+    real_mask = col.unsqueeze(0) < sl.unsqueeze(1)     # [B_real, L] bool
+    position_ids = torch.zeros(B_bucketed, L, dtype=torch.int64)
+    position_ids[:B_real] = col.unsqueeze(0) * real_mask
+
+    # --- token_type_ids ------------------------------------------------
+    tt_ids = torch.zeros(B_bucketed, L, dtype=torch.int64)
+
+    # --- SDPA additive mask --------------------------------------------
+    # Shape [B_bucketed, 1, L, L]; bidirectional (is_causal=False).
+    # Allowed pair (b, q, k): b < B_real and k < seq_lens[b].
+    # Vectorised: broadcast seq_lens across the key axis.
+    sdpa_mask = torch.full((B_bucketed, 1, L, L), -torch.inf, dtype=model_dtype)
+    if B_real > 0:
+        # key positions [L] < seq_lens [B_real] → allowed_k [B_real, L]
+        allowed_k = col.unsqueeze(0) < sl.unsqueeze(1)  # [B_real, L]  bool
+        # Expand to [B_real, 1, 1, L] then broadcast over the query axis
+        sdpa_mask[:B_real] = torch.where(
+            allowed_k[:, None, None, :],
+            torch.zeros(1, dtype=model_dtype),
+            torch.full((1,), -torch.inf, dtype=model_dtype),
+        )
+
+    return position_ids, tt_ids, sdpa_mask
+
+
 def _rebatch(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
@@ -135,7 +183,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         nn.Module.__init__(self)
 
         from hf_adapters.auto_spyre_model import AutoSpyreModel, resolve_adapter_module
-        from hf_adapters.hf_common import prefill_encoder
+        from hf_adapters.hf_common import get_model_dtype, prefill_encoder
 
         model_path = vllm_config.model_config.model
         self._adapter_module = resolve_adapter_module(model_path)
@@ -148,6 +196,9 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
             self._adapter_module.__name__,
         )
         self.model = AutoSpyreModel.from_pretrained(model_path)
+        # Cache dtype and device once; used by _build_encoder_inputs / fast forward.
+        self._model_dtype: torch.dtype = get_model_dtype(self.model)
+        self._spyre_device: torch.device = next(self.model.parameters()).device
 
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
@@ -165,25 +216,41 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Fast path: runner pre-shaped the inputs in _prepare_inputs, no rebatch needed.
+        # Fast path: runner pre-shaped the inputs in _prepare_inputs.
         batched_ids = kwargs.get("encoder_batched_ids")
-        attention_mask = kwargs.get("encoder_attention_mask")
-        batch_size = kwargs.get("encoder_batch_size", 0)
+        seq_lens: list[int] | None = kwargs.get("encoder_seq_lens")
+        batch_size: int = kwargs.get("encoder_batch_size", 0)
+        int_mask: torch.Tensor | None = None
 
         if batched_ids is None:
             # Fallback for dummy/warmup runs and direct forward() calls without runner.
             num_real_tokens: int = kwargs.get("num_scheduled_tokens", 0) or int(positions.shape[0])
-            batched_ids, attention_mask, batch_size = _rebatch(
+            batched_ids, int_mask, batch_size = _rebatch(
                 input_ids.cpu(), positions.cpu(), num_real_tokens, pad_id=self._pad_token_id
             )
+            seq_lens = None
 
-        # prefill_encoder returns [B_bucketed, L_max, H] on Spyre.
-        last_hidden = self._prefill_encoder(
-            self._run_backbone_forward,
-            self.model,
-            batched_ids,
-            attention_mask,
-        )
+        if seq_lens is not None:
+            # Full fast path: build all auxiliary tensors and call the backbone directly.
+            position_ids, tt_ids, sdpa_mask = _build_encoder_inputs(
+                batched_ids, seq_lens, self._model_dtype
+            )
+            dev = self._spyre_device
+            last_hidden = self._run_backbone_forward(
+                self.model,
+                batched_ids.to(dev),
+                sdpa_mask.to(dev),
+                position_ids.to(dev),
+                tt_ids.to(dev),
+            )
+        else:
+            # Fallback: delegate to prefill_encoder (handles the integer mask from _rebatch).
+            last_hidden = self._prefill_encoder(
+                self._run_backbone_forward,
+                self.model,
+                batched_ids,
+                int_mask,
+            )
         # Drop batch-padding rows (rows batch_size..B_bucketed) before flattening
         # so the packed layout contains only real-sequence tokens.
         H = last_hidden.shape[-1]

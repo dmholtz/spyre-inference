@@ -541,6 +541,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._encoder_batched_ids: torch.Tensor | None = None
         self._encoder_attention_mask: torch.Tensor | None = None
         self._encoder_batch_size: int = 0  # real (un-bucketed) sequence count
+        self._encoder_seq_lens: list[int] | None = None
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -1122,6 +1123,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._encoder_batched_ids = batched
         self._encoder_attention_mask = mask
         self._encoder_batch_size = batch_size
+        self._encoder_seq_lens = seq_lens
         logger.debug(
             "encoder pre-shape: %d seqs → [%d, %d] (B_real=%d)",
             batch_size, batch_bucketed, max_len, batch_size,
@@ -1136,11 +1138,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 kwargs["encoder_batched_ids"] = self._encoder_batched_ids
                 kwargs["encoder_attention_mask"] = self._encoder_attention_mask
                 kwargs["encoder_batch_size"] = self._encoder_batch_size
+                kwargs["encoder_seq_lens"] = self._encoder_seq_lens
                 # Reset so a dummy run that doesn't call _prepare_inputs won't
                 # carry stale tensors forward.
                 self._encoder_batched_ids = None
                 self._encoder_attention_mask = None
                 self._encoder_batch_size = 0
+                self._encoder_seq_lens = None
         return kwargs
 
     def _warmup_pooling_bucket_shapes(self) -> None:
