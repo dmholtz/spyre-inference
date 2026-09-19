@@ -532,6 +532,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
 
+        # Tracks the unpadded token count for the current step so that
+        # _init_model_kwargs can inject it into the model's forward kwargs.
+        self._num_scheduled_tokens: int = 0
+
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
         # Spyre doesn't support all dtypes (int32, bool) natively.
@@ -1036,6 +1040,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Decoder and pooling body: 1D ``compile_sizes`` after warmup.
         Attention ``(B, L)`` is applied in ``SpyreEncoderAttentionImpl``.
         """
+        self._num_scheduled_tokens = num_tokens
         pad = self._spyre_bucket_batch_descriptor(num_tokens, num_reqs, num_scheduled_tokens_np)
         if pad is not None:
             return CUDAGraphMode.NONE, pad, False, None, None
@@ -1073,6 +1078,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if desc is None:
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
+
+    def _init_model_kwargs(self) -> dict:
+        kwargs = super()._init_model_kwargs()
+        if self.model_config.runner_type == "pooling":
+            kwargs["num_scheduled_tokens"] = self._num_scheduled_tokens
+        return kwargs
 
     def _warmup_pooling_bucket_shapes(self) -> None:
         """Dummy each attention ``(B, L)``. Body already 1D-pads after warmup."""
