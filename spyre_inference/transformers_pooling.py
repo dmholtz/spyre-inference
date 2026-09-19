@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Iterable
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sequence import IntermediateTensors
@@ -164,6 +165,17 @@ class SpyreTransformersEmbeddingModel(nn.Module, VllmModelForPooling):
         raise NotImplementedError(
             "SpyreTransformersEmbeddingModel does not support pipeline parallelism"
         )
+
+    def create_attention_instances(self) -> dict[int, Attention]:
+        # Return an empty dict if the underlying model handles attention natively
+        # without registering vLLM Attention layers for KV cache management.
+        return {}
+
+    def recursive_replace(self) -> None:
+        # No-op: Do not replace linears, norms, convolutions, or fusions.
+        # All weights remain standard PyTorch modules on the target device
+        # once init_parameters() finishes.
+        pass
 
 
 # Using_transformers_backend() compares _ModelInfo.architecture, which is
