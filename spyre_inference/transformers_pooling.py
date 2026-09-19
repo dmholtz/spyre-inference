@@ -56,27 +56,37 @@ logger = init_logger(__name__)
 _BLOCK_SIZE = 64  # Spyre stick size (128 bytes / 2 bytes per fp16 element)
 
 
+def _next_power_of_two(n: int) -> int:
+    """Smallest power of two >= n (minimum 1)."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
 def _rebatch(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     num_real_tokens: int,
     pad_id: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack flat ``input_ids[0:num_real_tokens]`` into ``[B, L_max]``.
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pack flat ``input_ids[0:num_real_tokens]`` into ``[B_bucketed, L_max]``.
 
     Uses only the first ``num_real_tokens`` entries of ``input_ids`` and
     ``positions``, ignoring any bucket-padding zeros that follow.
 
-    ``B``     = number of sequences (position resets to 0 within the real
-                region, each preceded by a non-zero position).
-    ``L_max`` = ``max(positions[:num_real_tokens]) + 1``, rounded up to the
-                next ``_BLOCK_SIZE`` multiple.
+    ``B_real``     = number of sequences (position resets within the real region).
+    ``B_bucketed`` = next power of two >= ``B_real``; extra rows are zero-padded.
+                     Bucketing the batch dimension reduces recompilations when
+                     batch size varies across requests.
+    ``L_max``      = ``max(positions[:num_real_tokens]) + 1``, rounded up to the
+                     next ``_BLOCK_SIZE`` multiple.
 
-    Tokens are placed at ``batched[seq_idx, pos]`` directly — no offset
-    accumulation needed.
+    Tokens are placed at ``batched[seq_idx, pos]`` directly.
 
-    Returns ``(batched_ids, attention_mask)`` both on CPU, mirroring the
-    layout that ``prefill_encoder`` expects.
+    Returns ``(batched_ids, attention_mask, B_real)`` all on CPU.
+    ``B_real`` is needed by the caller to strip the batch-padding rows from the
+    model output before flattening back to the packed token layout.
     """
     pos = positions[:num_real_tokens].tolist()
     ids = input_ids[:num_real_tokens]
@@ -86,11 +96,12 @@ def _rebatch(
         if pos[i] == 0:  # pos[i-1] > 0 guaranteed within the real region
             batch_size += 1
 
+    batch_bucketed = _next_power_of_two(batch_size)
     raw_max = int(max(pos)) + 1  # 0-indexed; +1 gives token count
     max_len = ((raw_max + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE
 
-    batched = torch.full((batch_size, max_len), pad_id, dtype=input_ids.dtype)
-    mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+    batched = torch.full((batch_bucketed, max_len), pad_id, dtype=input_ids.dtype)
+    mask = torch.zeros((batch_bucketed, max_len), dtype=torch.long)
 
     seq_idx = 0
     for i in range(num_real_tokens):
@@ -100,8 +111,11 @@ def _rebatch(
         batched[seq_idx, p] = ids[i]
         mask[seq_idx, p] = 1
 
-    print("rebatch: input [%d] → batched [%d, %d]", num_real_tokens, batch_size, max_len)
-    return batched, mask
+    logger.debug(
+        "rebatch: %d real tokens → [%d, %d] (B_real=%d)",
+        num_real_tokens, batch_bucketed, max_len, batch_size,
+    )
+    return batched, mask, batch_size
 
 from vllm.model_executor.models.transformers import TransformersEmbeddingModel
 
@@ -152,31 +166,28 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         **kwargs,
     ) -> torch.Tensor:
         num_real_tokens: int = kwargs.get("num_scheduled_tokens", 0) or int(positions.shape[0])
-        batched_ids, attention_mask = _rebatch(
+        batched_ids, attention_mask, batch_size = _rebatch(
             input_ids.cpu(), positions.cpu(), num_real_tokens, pad_id=self._pad_token_id
         )
-        # prefill_encoder returns [B, L, H] on Spyre (with block-pad cropped).
+        # prefill_encoder returns [B_bucketed, L_max, H] on Spyre.
         last_hidden = self._prefill_encoder(
             self._run_backbone_forward,
             self.model,
             batched_ids,
             attention_mask,
         )
-        # Flatten [B, L, H] → [B*L, H] and crop to the real token count.
-        # During dummy/warmup runs the positions buffer is all zeros so _rebatch
-        # produces fewer rows (B=1, L=64) than num_tokens_padded.  Pad with zeros
-        # so that upstream's logit_indices can always index into a full-sized
-        # [num_tokens_padded, H] tensor without going out of bounds.
-        flat = last_hidden.reshape(-1, last_hidden.shape[-1])
+        # Drop batch-padding rows (rows batch_size..B_bucketed) before flattening
+        # so the packed layout contains only real-sequence tokens.
+        H = last_hidden.shape[-1]
+        flat = last_hidden[:batch_size].reshape(-1, H)  # [batch_size * L_max, H]
+        # Pad to num_tokens_padded so upstream's logit_indices never go out of
+        # bounds (dummy runs produce fewer real rows than the padded token budget).
         num_tokens_padded = int(positions.shape[0])
         if flat.shape[0] < num_tokens_padded:
-            pad = torch.zeros(
-                num_tokens_padded - flat.shape[0],
-                flat.shape[1],
-                dtype=flat.dtype,
-                device=flat.device,
-            )
-            flat = torch.cat([flat, pad], dim=0)
+            flat = torch.cat([
+                flat,
+                torch.zeros(num_tokens_padded - flat.shape[0], H, dtype=flat.dtype, device=flat.device),
+            ], dim=0)
         return flat[:num_tokens_padded]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
