@@ -53,54 +53,60 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _seq_lengths_from_positions(positions: torch.Tensor) -> list[int]:
-    """Recover per-sequence lengths from flat packed position ids.
-
-    vLLM sets positions as ``[0, 1, ..., L1-1, 0, 1, ..., L2-1, ...]``.
-    A new sequence starts wherever ``positions[i] <= positions[i-1]``
-    (reset to 0) or at token 0 of the whole batch.
-    """
-    pos = positions.tolist()
-    lengths: list[int] = []
-    run = 1
-    for i in range(1, len(pos)):
-        if pos[i] <= pos[i - 1]:
-            lengths.append(run)
-            run = 1
-        else:
-            run += 1
-    lengths.append(run)
-    return lengths
-
-
 _BLOCK_SIZE = 64  # Spyre stick size (128 bytes / 2 bytes per fp16 element)
 
 
 def _rebatch(
     input_ids: torch.Tensor,
-    seq_lengths: list[int],
+    positions: torch.Tensor,
     pad_id: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack flat ``input_ids [T]`` into ``[B, L_max]`` with right-padding.
+    """Pack flat ``input_ids [T_padded]`` into ``[B, L_max]`` with right-padding.
 
-    ``L_max`` is rounded up to the next multiple of ``_BLOCK_SIZE`` so that
-    ``prefill_encoder``'s internal block-pad is always a no-op.  This keeps the
-    sequence-length dimension constant across calls with the same maximum real
-    length, avoiding repeated recompiles when the batch size varies.
+    ``B`` and ``L_max`` are derived purely from the position tensor so that the
+    bucket-padding zeros appended by the Spyre runner (all with position 0) are
+    never mistaken for real sequence starts:
 
-    Returns ``(batched_ids, attention_mask)`` both on CPU, mirroring the
-    layout that ``prefill_encoder`` expects.
+    * ``B``      = number of position resets (``pos[i] == 0 and pos[i-1] != 0``),
+                   plus 1 for the first sequence.  The all-zero padding tail has
+                   no preceding non-zero value, so it does not fire this condition.
+    * ``L_max``  = ``max(positions) + 1``, rounded up to the next ``_BLOCK_SIZE``
+                   multiple.  Works because padding tokens carry position 0, so
+                   they never inflate the maximum.
+
+    Tokens are placed at ``batched[seq_idx, pos]`` directly — no length counting
+    needed.
+
+    Returns ``(batched_ids, attention_mask)`` both on CPU, mirroring the layout
+    that ``prefill_encoder`` expects.
     """
-    batch_size = len(seq_lengths)
-    raw_max = max(seq_lengths)
-    max_len = ((raw_max + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE
+    pos = positions.tolist()
+    T = len(pos)
+
+    # Count real sequences: a new one starts at index 0 and at every index i
+    # where pos[i] == 0 and the previous token had a non-zero position (i.e. it
+    # was a real token ending a real sequence, not a padding zero).
+    batch_size = 1
+    for i in range(1, T):
+        if pos[i] == 0 and pos[i - 1] != 0:
+            batch_size += 1
+
+    raw_max = int(max(pos)) + 1  # positions are 0-indexed; +1 gives token count
+    max_len = ((raw_max + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE  # round up
+
     batched = torch.full((batch_size, max_len), pad_id, dtype=input_ids.dtype)
     mask = torch.zeros((batch_size, max_len), dtype=torch.long)
-    offset = 0
-    for i, length in enumerate(seq_lengths):
-        batched[i, :length] = input_ids[offset : offset + length]
-        mask[i, :length] = 1
-        offset += length
+
+    seq_idx = 0
+    for i in range(T):
+        p = pos[i]
+        if i > 0 and p == 0 and pos[i - 1] != 0:
+            seq_idx += 1
+        if seq_idx < batch_size:  # skip padding tail (seq_idx would overflow)
+            batched[seq_idx, p] = input_ids[i]
+            mask[seq_idx, p] = 1
+
+    logger.debug("rebatch: input [%d] → batched [%d, %d]", T, batch_size, max_len)
     return batched, mask
 
 from vllm.model_executor.models.transformers import TransformersEmbeddingModel
@@ -151,10 +157,8 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        seq_lengths = _seq_lengths_from_positions(positions)
-        print("Running forward with", seq_lengths)
         batched_ids, attention_mask = _rebatch(
-            input_ids.cpu(), seq_lengths, pad_id=self._pad_token_id
+            input_ids.cpu(), positions.cpu(), pad_id=self._pad_token_id
         )
         # prefill_encoder returns [B, L, H] on Spyre (with block-pad cropped).
         last_hidden = self._prefill_encoder(
