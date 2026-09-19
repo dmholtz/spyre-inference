@@ -94,8 +94,10 @@ def _rebatch(
         offset += length
     return batched, mask
 
+from vllm.model_executor.models.transformers import TransformersEmbeddingModel
 
-class SpyreTransformersEmbeddingModel(nn.Module, VllmModelForPooling):
+
+class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
     """Encoder pooling model for ``--model-impl transformers`` on Spyre.
 
     Loaded via hf_adapters so the backbone uses compiled blocks and the
@@ -176,6 +178,9 @@ class SpyreTransformersEmbeddingModel(nn.Module, VllmModelForPooling):
         # All weights remain standard PyTorch modules on the target device
         # once init_parameters() finishes.
         pass
+
+    def _patch_config():
+        print("patch nothing")
 
 
 # Using_transformers_backend() compares _ModelInfo.architecture, which is
