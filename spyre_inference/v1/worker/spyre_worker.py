@@ -200,10 +200,10 @@ class TorchSpyreWorker(Worker):
             "FIXME: Overriding aten.layer_norm.default decomposition to work around"
             " torch-spyre fusion barrier (exx2/layernormscale/layernormnorm)"
         )
-        spyre_decompositions[
-            torch.ops.aten.layer_norm.default
-        ] = lambda input, normalized_shape, weight=None, bias=None, eps=1e-5: (
-            _layer_norm_kernel(input, weight, bias, eps)
+        spyre_decompositions[torch.ops.aten.layer_norm.default] = (
+            lambda input, normalized_shape, weight=None, bias=None, eps=1e-5: _layer_norm_kernel(
+                input, weight, bias, eps
+            )
         )
 
         warmup_start_time = time.perf_counter()
