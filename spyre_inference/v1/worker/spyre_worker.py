@@ -189,6 +189,23 @@ class TorchSpyreWorker(Worker):
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
 
+        # FIXME: Work around torch-spyre's spyre_layer_norm routing through
+        # exx2 → layernormscale → layernormnorm, each of which forces
+        # .realize() in its lowering and breaks fusion across the norm.
+        # Replace with the plain-aten body so Inductor fuses freely.
+        # Remove once torch-spyre patches spyre_layer_norm upstream.
+        from spyre_inference.custom_ops.layer_norm import _layer_norm_kernel
+
+        logger.warning(
+            "FIXME: Overriding aten.layer_norm.default decomposition to work around"
+            " torch-spyre fusion barrier (exx2/layernormscale/layernormnorm)"
+        )
+        spyre_decompositions[
+            torch.ops.aten.layer_norm.default
+        ] = lambda input, normalized_shape, weight=None, bias=None, eps=1e-5: (
+            _layer_norm_kernel(input, weight, bias, eps)
+        )
+
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
