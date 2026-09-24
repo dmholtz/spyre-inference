@@ -50,6 +50,27 @@ import torch
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
 
+# Architectures for which the spyre_layer_norm three-op chain
+# (exx2 → layernormscale → layernormnorm) should be replaced by
+# _layer_norm_kernel to restore Inductor fusion (torch-spyre#4816).
+LAYER_NORM_FUSE_ARCHS: frozenset[str] = frozenset(
+    [
+        "BertModel",
+        "BertForMaskedLM",
+        "BertForSequenceClassification",
+        "BertForTokenClassification",
+        "BertSpladeSparseEmbeddingModel",
+        "BgeM3EmbeddingModel",
+        "RobertaModel",
+        "RobertaForMaskedLM",
+        "RobertaForSequenceClassification",
+        "RobertaForTokenClassification",
+        "XLMRobertaModel",
+        "XLMRobertaForSequenceClassification",
+        "XLMRobertaForTokenClassification",
+    ]
+)
+
 
 def _layer_norm_kernel(
     x: torch.Tensor,

@@ -189,22 +189,7 @@ class TorchSpyreWorker(Worker):
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
 
-        # FIXME: Work around torch-spyre's spyre_layer_norm routing through
-        # exx2 → layernormscale → layernormnorm, each of which forces
-        # .realize() in its lowering and breaks fusion across the norm.
-        # Replace with the plain-aten body so Inductor fuses freely.
-        # Remove once torch-spyre patches spyre_layer_norm upstream.
-        from spyre_inference.custom_ops.layer_norm import _layer_norm_kernel
-
-        logger.warning(
-            "FIXME: Overriding aten.layer_norm.default decomposition to work around"
-            " torch-spyre fusion barrier (exx2/layernormscale/layernormnorm)"
-        )
-        spyre_decompositions[torch.ops.aten.layer_norm.default] = (
-            lambda input, normalized_shape, weight=None, bias=None, eps=1e-5: _layer_norm_kernel(
-                input, weight, bias, eps
-            )
-        )
+        self._substitute_layer_norm_impl_for_selected_models(spyre_decompositions)
 
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
@@ -242,3 +227,30 @@ class TorchSpyreWorker(Worker):
             logger.debug("Starting torch profiler with trace name: %s", trace_name)
 
         return super().profile(is_start, profile_prefix)
+    
+    def _substitute_layer_norm_impl_for_selected_models(self, spyre_decompositions: dict) -> None:
+        """Override spyre_layer_norm with a plain-aten body for selected architectures.
+
+        FIXME (torch-spyre#4816): spyre_layer_norm decomposes into exx2 → layernormscale → layernormnorm,
+        each forcing .realize() and blocking Inductor fusion.
+        """
+        from spyre_inference.custom_ops.layer_norm import (
+            LAYER_NORM_FUSE_ARCHS,
+            _layer_norm_kernel,
+        )
+
+        architectures = (
+            getattr(self.vllm_config.model_config.hf_config, "architectures", None) or []
+        )
+        if not any(arch in LAYER_NORM_FUSE_ARCHS for arch in architectures):
+            return
+
+        logger.warning(
+            "FIXME: Overriding aten.layer_norm.default decomposition to work around"
+            " torch-spyre fusion barrier (exx2/layernormscale/layernormnorm)"
+        )
+        spyre_decompositions[torch.ops.aten.layer_norm.default] = (
+            lambda input, normalized_shape, weight=None, bias=None, eps=1e-5: _layer_norm_kernel(
+                input, weight, bias, eps
+            )
+        )
