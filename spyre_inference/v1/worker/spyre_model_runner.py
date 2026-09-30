@@ -53,6 +53,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
@@ -71,6 +72,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
+from spyre_inference.custom_ops.conv import SpyreConv2d
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -82,8 +84,9 @@ from spyre_inference.custom_ops.mlp_pad import (
     install_mlp_pad_weight_loader,
     verify_padded_intermediate_size,
 )
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models.mistral import reset_llama4_scale_cache
+from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -99,10 +102,12 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreDispatchPooler
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    encoder_cls_rows,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
@@ -369,25 +374,15 @@ class _SpyreModelWrapper:
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
-        # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
-        # in models/roberta.py.
-        def _convert_int(t):
-            if (
-                t is not None
-                and isinstance(t, torch.Tensor)
-                and t.dtype in (torch.int32, torch.int64)
-            ):
-                return convert(t, dtype=torch.int64, device=self._spyre_device)
-            return t
-
-        args_converted = []
-        for arg in args:
-            args_converted.append(_convert_int(arg))
-
-        kwargs_converted = {}
-        for key in kwargs:
-            val = kwargs.get(key)
-            kwargs_converted[key] = _convert_int(val)
+        # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on the
+        # host in ``_preprocess``, before this copy.
+        is_integer = lambda t: t.dtype in (torch.int32, torch.int64)
+        args_converted = convert_tensor_tree(
+            args, device=self._spyre_device, dtype=torch.int64, predicate=is_integer
+        )
+        kwargs_converted = convert_tensor_tree(
+            kwargs, device=self._spyre_device, dtype=torch.int64, predicate=is_integer
+        )
 
         # The Llama-4 scale cache keys on `positions` identity, blind to an in-place rewrite.
         reset_llama4_scale_cache()
@@ -397,11 +392,7 @@ class _SpyreModelWrapper:
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
-
-            def _to_cpu(x):
-                return convert(x, device="cpu")
-
-            result = tree_map(_to_cpu, result)
+            result = convert_tensor_tree(result, device="cpu")
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
@@ -437,7 +428,7 @@ class _SpyreModelWrapper:
         if padded_rows != num_rows:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
-        hidden_states = convert(hidden_states, device=self._spyre_device)
+        hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -620,7 +611,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
+        block_table._compute_slot_mapping_kernel = (  # ty: ignore[invalid-assignment]
+            _compute_slot_mapping_kernel
+        )
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -671,6 +664,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+        for module in self.model.modules():
+            if isinstance(module, SpyreConv2d):
+                module.process_weights_after_loading()
 
         # CLS/LAST gather on Spyre. MEAN reduces on Spyre too (two-kernel fp32
         # round-trip sum). FP32 linear heads stay on CPU.
@@ -1439,10 +1435,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
         if grid is None:
-            return out
+            return self._offset_preprocess_positions(out)
         input_ids, inputs_embeds, positions, *rest = out
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
+        hf_config = getattr(self.model_config, "hf_config", None)
+        position_offset = roberta_position_delta(hf_config)
 
         if input_ids is not None:
             ids, pos = expand_packed_to_encoder_grid(
@@ -1452,6 +1450,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 width,
                 extent,
                 pad_token_id=self._encoder_pad_token_id(),
+                position_offset=position_offset,
             )
             assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
             grid_ids = convert(ids, input_ids.device)
@@ -1467,6 +1466,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 query_lens,
                 width,
                 extent,
+                position_offset=position_offset,
             )
             grid_ids = None
             grid_embeds = convert(
@@ -1506,6 +1506,51 @@ class TorchSpyreModelRunner(GPUModelRunner):
             convert(pos, positions.device),
             *regrouped,
         )
+
+    def _offset_preprocess_positions(self, out: Any) -> Any:
+        """Add the RoBERTa offset on the packed path, before the wrapper's H2D.
+
+        The rectangular path adds it inside ``expand_packed_to_encoder_grid``.
+        Here the body stays packed, so the position tensor upstream returned is
+        rewritten in place in the tuple.
+        """
+        hf_config = getattr(self.model_config, "hf_config", None)
+        delta = roberta_position_delta(hf_config)
+        if delta == 0 or not isinstance(out, tuple) or len(out) < 3:
+            return out
+        positions = out[2]
+        if not isinstance(positions, torch.Tensor):
+            return out
+        return (out[0], out[1], offset_host_positions(positions, delta), *out[3:])
+
+    def _rectangular_cls(self, pooling_metadata: PoolingMetadata) -> bool:
+        """True when this rectangular step's only task gathers the CLS row.
+
+        LAST and MEAN address packed rows, so they still take the unpad gather.
+        A mixed-task batch does too: one hidden-state layout has to serve every
+        task in the step.
+        """
+        grid = self._encoder_grid
+        if grid is None:
+            return False
+        tasks = list(pooling_metadata.tasks)
+        if len(set(tasks)) != 1:
+            return False
+        pooler = cast(VllmModelForPooling, self.model).pooler
+        sub = pooler
+        if isinstance(pooler, SpyreDispatchPooler):
+            sub = pooler.poolers_by_task.get(tasks[0])
+            if sub is None:
+                return False
+        if isinstance(sub, SequencePooler):
+            pooling = sub.pooling
+        else:
+            pooling = sub
+        if not isinstance(pooling, SpyreCLSPool):
+            return False
+        cursor = pooling_metadata.get_pooling_cursor()
+        counts = cursor.num_scheduled_tokens_cpu if cursor is not None else None
+        return counts is not None and int(counts.numel()) == len(grid[2])
 
     def _encoder_pad_token_id(self) -> int:
         """Pad id for batch-pad filler tokens; their outputs are masked and dropped."""
@@ -1590,17 +1635,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Either all or none of the requests in a batch must be pooling request"
         )
 
-        # Not a crop: the row count stays the buffer's. On the rectangular path this
-        # re-compacts the grid to the packed order the cursor addresses; on the ragged
-        # path it is a no-op, since each pooler gathers itself from host cursor counts.
-        hidden_states = self._unpad_encoder_hidden(
-            convert(hidden_states, self._spyre_device), num_scheduled_tokens
-        )
-
         # Build the cursor on CPU: upstream does ``cumsum[1:] - 1`` for
         # last_token_indices; that offset-1 view is not stick-aligned on
-        # Spyre (copy_from_d2d fails). SpyreCLS/Last only read host
-        # ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.
+        # Spyre (copy_from_d2d fails). So the ``*_gpu`` fields here are host
+        # tensors, despite the name, and the Spyre pools read them as such.
+        # A Spyre-specific PoolingMetadata (like SpyreAttentionMetadata) would
+        # make that explicit.
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
@@ -1608,6 +1648,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             seq_lens_cpu,
             device=torch.device("cpu"),
         )
+
+        hidden_states = convert(hidden_states, self._spyre_device)
+        # CLS on a rectangle already has its row at ``seq_idx * extent``. Skipping
+        # the unpad gather leaves LAST/MEAN on the packed layout they index.
+        # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
+        grid = self._encoder_grid
+        if grid is not None and self._rectangular_cls(pooling_metadata):
+            extent, _width, query_lens = grid
+            pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(
+                encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
+            )
+        else:
+            # Not a crop: the row count stays the buffer's. On the rectangular path
+            # this re-compacts the grid to the packed order the cursor addresses; on
+            # the ragged path it is a no-op.
+            hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
 
         model = cast(VllmModelForPooling, self.model)
         raw_pooler_output: PoolerOutput = model.pooler(

@@ -32,7 +32,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
-    _MIN_BATCHED_SEQS,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -181,7 +180,11 @@ def _run_spyre_attn_test(
     # The extra entries point at garbage pages on purpose: padded blocks are
     # fully masked and must not affect the result.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    # The num_blocks ladder is derived from block_size, so the bucketer needs this
+    # test's value rather than the fixture default or it pads to the wrong width.
+    bucketer_config = get_current_vllm_config()
+    bucketer_config.cache_config.block_size = block_size
+    buckets = SpyreAttnBucketer(bucketer_config).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
@@ -1772,7 +1775,7 @@ def test_batched_decode_chunking_covers_every_block(
     # real block count, so this is what reaches the lattice's top entry.
     ctx = max_model_len
 
-    for num_seqs in range(_MIN_BATCHED_SEQS, max_num_seqs + 1):
+    for num_seqs in range(1, max_num_seqs + 1):
         seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
         query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
         block_table = torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
@@ -1839,10 +1842,10 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     num_kv_heads, num_query_heads, head_size = 2, 4, 64
 
     vllm_config = get_current_vllm_config()
-    vllm_config.scheduler_config.max_num_seqs = _MIN_BATCHED_SEQS
+    vllm_config.scheduler_config.max_num_seqs = 1
     vllm_config.model_config.max_model_len = 2048
 
-    num_seqs = _MIN_BATCHED_SEQS
+    num_seqs = 1
     ctx = 256
     blocks_per_seq = ctx // block_size
     seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
@@ -2263,7 +2266,6 @@ def test_batched_decode_metadata_follows_env(
     must gate on the same flag — `_batched_decode_preconditions_met` does.
     """
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", batched_decode)
-    # 4 decode seqs: at or above _MIN_BATCHED_SEQS, so the count is not what gates here.
     metadata = _padded_mask_metadata([(1, 256)] * 4, block_size=64)
 
     if batched_decode == "1":
