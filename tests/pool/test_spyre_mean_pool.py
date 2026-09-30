@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre MEAN pooling: on-device mask matmul; CPU fallback is host ``MeanPool``.
+"""Spyre MEAN pooling: on-device fp32 round-trip sum; CPU fallback is host ``MeanPool``.
 
 Destagger of a device fp32 sum is garbage; see
 ``test_spyre_fp32_reduce_d2h_with_destagger``.

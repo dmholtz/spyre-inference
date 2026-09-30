@@ -185,12 +185,10 @@ class SpyreLastPool(LastPool):
 def _mean_pool_mask_mul(indicator: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
     """``[rows, T]`` 0/1 mask times ``[T, H]`` hidden states, broadcast to ``[rows, T, H]``.
 
-    ``.contiguous()`` gives the fp32 reduce kernel below a real materialized
-    input rather than a view: chaining the round-trip sum directly onto a
-    broadcast-multiply's output crashes the backend compiler (``dbo-opt``
-    subprocess failure) even on shapes the reduce alone compiles fine for, so
-    this must land as its own dispatched kernel, not fuse into the reduce's
-    graph -- see ``_mean_pool_fp32_reduce``.
+    Chaining ``_mean_pool_fp32_reduce`` directly onto this op's output crashes
+    the backend compiler (``dbo-opt`` failure), even on shapes the reduce alone
+    compiles fine for -- ``.contiguous()`` forces a real materialized boundary
+    between the two kernels.
     """
     return (indicator.unsqueeze(-1) * hidden_states.unsqueeze(0)).contiguous()
 
@@ -217,20 +215,15 @@ compile_guard.watch(_mean_pool_fp32_reduce, "mean-pool fp32 round-trip sum")
 class SpyreMeanPool(MeanPool):
     """MEAN via a two-kernel on-device fp32 sum; CPU fallback is upstream unchanged.
 
-    A raw device fp32 sum is unsafe to move or cast directly: fp32 lives
-    staggered on Spyre (torch-spyre#2971), so destaggering via ``to(fp16)``
-    then convert then upcast produced garbage (e5/roberta cosine ~-0.02) --
-    and a fp16 mask @ hidden_states matmul, tried instead, loses precision
-    over a deep reduction (measured ~0.03 abs error against a fp32 CPU mean,
-    fp16 has ~11 bits of mantissa) because the matmul accumulator itself is
-    fp16, not fp32. torch-spyre#2619's fp16->fp32->sum->fp16 round-trip does
-    keep the accumulation in fp32 (measured ~0.002 abs error), but only when
-    split across two independently-dispatched kernels with a real ``.clone()``
-    materialization between them -- ``_mean_pool_mask_mul`` then
-    ``_mean_pool_fp32_reduce`` above. This still avoids the D2H + host reduce
-    the original implementation paid on every step: only the small ``[rows, T]``
-    mask and ``[rows, 1]`` lengths cross in, and the small pooled result
-    crosses out.
+    A raw device fp32 sum is unsafe to move or cast directly (torch-spyre#2971:
+    fp32 lives staggered on Spyre). A fp16 mask @ hidden_states matmul avoids
+    that but loses precision over a deep reduction, since the matmul
+    accumulator is fp16. torch-spyre#2619's fp16->fp32->sum->fp16 round-trip
+    keeps the accumulation in fp32 instead, split across
+    ``_mean_pool_mask_mul`` / ``_mean_pool_fp32_reduce`` above with a real
+    ``.clone()`` between them. Only the small ``[rows, T]`` mask and
+    ``[rows, 1]`` lengths cross onto the device, and the small pooled result
+    crosses back -- no full D2H of ``hidden_states``.
     """
 
     def forward(self, hidden_states, pooling_metadata):
