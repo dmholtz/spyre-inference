@@ -102,7 +102,14 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
-from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreDispatchPooler
+from spyre_inference.v1.pool.spyre_pooler import (
+    SpyreCLSPool,
+    SpyreDispatchPooler,
+    SpyreMeanPool,
+    _iter_modules,
+    _mean_pool_fp32_reduce,
+    _mean_pool_mask_mul,
+)
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -1326,10 +1333,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         full Inductor compile mid-request; it was the whole residual warm-up gap
         once the attention kernels were covered. The poolers round their row count
         to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
+
+        ``SpyreMeanPool``'s reduce kernels specialize on the same row width and
+        had the same gap, uncovered until now.
         """
         if not self._pooling_on_spyre:
             return
         rows = hidden_states.shape[0]
+        # poolers_by_task is a plain dict; nn.Module.modules() doesn't descend into it.
+        pooler = cast(VllmModelForPooling, self.get_model()).pooler
+        mean_pooling = any(isinstance(m, SpyreMeanPool) for m in _iter_modules(pooler))
         # Up to the power of two at or above the limit, which is not itself always one:
         # 6 sequences round up to 8 rows, so stopping at the limit misses that width.
         limit = 1 << max(0, self.scheduler_config.max_num_seqs - 1).bit_length()
@@ -1337,7 +1350,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         while width <= limit:
             if width <= rows:
                 select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
+                if mean_pooling:
+                    self._warm_mean_pool_kernels(hidden_states, width)
             width *= 2
+
+    def _warm_mean_pool_kernels(self, hidden_states: torch.Tensor, width: int) -> None:
+        """Compile ``SpyreMeanPool``'s reduce kernels, mirroring its mask/lens construction."""
+        device = hidden_states.device
+        t = hidden_states.shape[0]
+        mask = convert(torch.zeros(width, t, dtype=torch.float16), device)
+        lens = convert(torch.ones(width, 1, dtype=torch.float32), device)
+        prod = _mean_pool_mask_mul(mask, hidden_states).clone()
+        _mean_pool_fp32_reduce(prod, lens)
 
     @torch.inference_mode()
     def _warm_encoder_inline_paths(self) -> None:
