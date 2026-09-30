@@ -672,8 +672,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
-        # FP32 linear heads stay on CPU.
+        # CLS/LAST gather on Spyre. MEAN reduces on Spyre too (two-kernel fp32
+        # round-trip sum). FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
