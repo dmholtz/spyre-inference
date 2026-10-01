@@ -103,7 +103,6 @@ from spyre_inference.v1.pool import (
     select_rows,
 )
 from spyre_inference.v1.pool.spyre_pooler import (
-    SpyreClassifierLinear,
     SpyreCLSPool,
     SpyreDispatchPooler,
     SpyreMeanPool,
@@ -1384,8 +1383,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self, head: SpyreRobertaClassificationHead, x: torch.Tensor
     ) -> None:
         """Compile ``SpyreRobertaClassificationHead``'s fused kernel at ``x``'s row width."""
-        dense = cast(SpyreClassifierLinear, head.dense)
-        out_proj = cast(SpyreClassifierLinear, head.out_proj)
+        dense, out_proj = head.dense, head.out_proj
         _roberta_classifier_head_kernel(x, dense.weight, dense.bias, out_proj.weight, out_proj.bias)
 
     @torch.inference_mode()

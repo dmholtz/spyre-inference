@@ -215,6 +215,7 @@ def _mean_pool_fp32_reduce(prod: torch.Tensor, lens: torch.Tensor) -> torch.Tens
     return (total / lens).to(prod.dtype)
 
 
+# Flags a mid-request recompile below, which otherwise just adds latency silently.
 compile_guard.watch(_mean_pool_mask_mul, "mean-pool masked multiply")
 compile_guard.watch(_mean_pool_fp32_reduce, "mean-pool fp32 round-trip sum")
 
@@ -532,6 +533,7 @@ def _roberta_classifier_head_kernel(
     return out
 
 
+# Flags a mid-request recompile below, which otherwise just adds latency silently.
 compile_guard.watch(_roberta_classifier_head_kernel, "roberta classifier head")
 
 
@@ -543,6 +545,9 @@ class SpyreRobertaClassificationHead(nn.Module):
     individual ``forward`` in favor of one compiled kernel.
     """
 
+    dense: SpyreClassifierLinear
+    out_proj: SpyreClassifierLinear
+
     @classmethod
     def convert(cls, head: RobertaClassificationHead) -> SpyreRobertaClassificationHead:
         SpyreClassifierLinear.convert(head.dense)
@@ -551,8 +556,7 @@ class SpyreRobertaClassificationHead(nn.Module):
         return cast(SpyreRobertaClassificationHead, head)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dense = cast(SpyreClassifierLinear, self.dense)
-        out_proj = cast(SpyreClassifierLinear, self.out_proj)
+        dense, out_proj = self.dense, self.out_proj
         weight = dense.weight
         if x.device != weight.device or x.dtype != weight.dtype:
             if weight.device.type == "spyre":
