@@ -103,12 +103,16 @@ from spyre_inference.v1.pool import (
     select_rows,
 )
 from spyre_inference.v1.pool.spyre_pooler import (
+    SpyreClassifierLinear,
     SpyreCLSPool,
     SpyreDispatchPooler,
     SpyreMeanPool,
+    SpyreRobertaClassificationHead,
     _iter_modules,
     _mean_pool_fp32_reduce,
     _mean_pool_mask_mul,
+    _roberta_classifier_head_kernel,
+    pad_row_count_to_bucket,
 )
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
@@ -1342,7 +1346,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rows = hidden_states.shape[0]
         # poolers_by_task is a plain dict; nn.Module.modules() doesn't descend into it.
         pooler = cast(VllmModelForPooling, self.get_model()).pooler
-        mean_pooling = any(isinstance(m, SpyreMeanPool) for m in _iter_modules(pooler))
+        pooler_modules = list(_iter_modules(pooler))
+        mean_pooling = any(isinstance(m, SpyreMeanPool) for m in pooler_modules)
+        classifier_heads = [
+            m for m in pooler_modules if isinstance(m, SpyreRobertaClassificationHead)
+        ]
         # Up to the power of two at or above the limit, which is not itself always one:
         # 6 sequences round up to 8 rows, so stopping at the limit misses that width.
         limit = 1 << max(0, self.scheduler_config.max_num_seqs - 1).bit_length()
@@ -1353,6 +1361,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if mean_pooling:
                     self._warm_mean_pool_kernels(hidden_states, width)
             width *= 2
+        # SpyreCLSPool slices its padded gather back to the real row count, which
+        # changes the device layout the classifier head's kernel guards on -- so
+        # warming needs that same gather-then-slice, not a freshly allocated tensor.
+        for head in classifier_heads:
+            for real_width in range(1, min(self.scheduler_config.max_num_seqs, rows) + 1):
+                idx, n_rows = pad_row_count_to_bucket(torch.zeros(real_width, dtype=torch.int64))
+                pooled = select_rows(hidden_states, idx)
+                pooled = pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
+                self._warm_classifier_head_kernel(head, pooled)
 
     def _warm_mean_pool_kernels(self, hidden_states: torch.Tensor, width: int) -> None:
         """Compile ``SpyreMeanPool``'s reduce kernels, mirroring its mask/lens construction."""
@@ -1362,6 +1379,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         lens = convert(torch.ones(width, 1, dtype=torch.float32), device)
         prod = _mean_pool_mask_mul(mask, hidden_states).clone()
         _mean_pool_fp32_reduce(prod, lens)
+
+    def _warm_classifier_head_kernel(
+        self, head: SpyreRobertaClassificationHead, x: torch.Tensor
+    ) -> None:
+        """Compile ``SpyreRobertaClassificationHead``'s fused kernel at ``x``'s row width."""
+        dense = cast(SpyreClassifierLinear, head.dense)
+        out_proj = cast(SpyreClassifierLinear, head.out_proj)
+        _roberta_classifier_head_kernel(x, dense.weight, dense.bias, out_proj.weight, out_proj.bias)
 
     @torch.inference_mode()
     def _warm_encoder_inline_paths(self) -> None:

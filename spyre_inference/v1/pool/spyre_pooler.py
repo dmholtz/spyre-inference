@@ -21,6 +21,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
 from vllm.model_executor.layers.pooler.seqwise.heads import (
@@ -38,9 +39,10 @@ from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.heads import TokenClassifierPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
+from vllm.model_executor.models.roberta import RobertaClassificationHead
 from vllm.v1.outputs import PoolerOutput
 
-from spyre_inference.custom_ops.linear import spyre_linear_t
+from spyre_inference.custom_ops.linear import _PAD_ROWS, spyre_linear_t
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
@@ -506,6 +508,62 @@ class SpyreClassifierLinear(nn.Linear):
         return spyre_linear_t(input, weight, self.bias, pad_rows=True)
 
 
+@torch.compile(dynamic=False)
+def _roberta_classifier_head_kernel(
+    x: torch.Tensor,
+    dense_wt: torch.Tensor,
+    dense_b: torch.Tensor,
+    out_wt: torch.Tensor,
+    out_b: torch.Tensor,
+) -> torch.Tensor:
+    """Fused ``dense -> tanh -> out_proj`` for a RoBERTa-style classifier head.
+
+    Row count is constant across both matmuls (CLS pooling leaves one row per
+    request), so the short-row pad/slice (torch-spyre#4032) happens once here
+    instead of once per ``spyre_linear_t`` call.
+    """
+    rows = x.shape[0]
+    if 0 < rows < _PAD_ROWS:
+        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
+    h = torch.tanh(torch.matmul(x, dense_wt) + dense_b)
+    out = torch.matmul(h, out_wt) + out_b
+    if 0 < rows < _PAD_ROWS:
+        out = out[:rows]
+    return out
+
+
+compile_guard.watch(_roberta_classifier_head_kernel, "roberta classifier head")
+
+
+class SpyreRobertaClassificationHead(nn.Module):
+    """Class-swap target for vLLM's ``RobertaClassificationHead``: one fused call.
+
+    ``dense``/``out_proj`` stay ``SpyreClassifierLinear`` instances (their weight
+    storage is reused directly); only this module's own ``forward`` bypasses their
+    individual ``forward`` in favor of one compiled kernel.
+    """
+
+    @classmethod
+    def convert(cls, head: RobertaClassificationHead) -> SpyreRobertaClassificationHead:
+        SpyreClassifierLinear.convert(head.dense)
+        SpyreClassifierLinear.convert(head.out_proj)
+        head.__class__ = cls
+        return cast(SpyreRobertaClassificationHead, head)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dense = cast(SpyreClassifierLinear, self.dense)
+        out_proj = cast(SpyreClassifierLinear, self.out_proj)
+        weight = dense.weight
+        if x.device != weight.device or x.dtype != weight.dtype:
+            if weight.device.type == "spyre":
+                x = convert(x, weight.device, weight.dtype)
+            else:
+                x = x.to(device=weight.device, dtype=weight.dtype)
+        return _roberta_classifier_head_kernel(
+            x, dense.weight, dense.bias, out_proj.weight, out_proj.bias
+        )
+
+
 def _classifier_roots(model: nn.Module) -> list[nn.Module]:
     """Classifier modules even when not registered in ``_modules``.
 
@@ -521,9 +579,18 @@ def _classifier_roots(model: nn.Module) -> list[nn.Module]:
 
 
 def patch_classifier_linears_for_spyre(roots: list[nn.Module]) -> int:
-    """Convert every ``nn.Linear`` under a classifier, in place."""
+    """Convert every ``nn.Linear`` under a classifier, in place.
+
+    A ``RobertaClassificationHead`` root gets its ``dense``/``out_proj`` pair
+    fused into one compiled call instead (``SpyreRobertaClassificationHead``) --
+    see its docstring for why.
+    """
     n = 0
     for root in roots:
+        if isinstance(root, RobertaClassificationHead):
+            SpyreRobertaClassificationHead.convert(root)
+            n += 2
+            continue
         candidates = [root] if isinstance(root, nn.Linear) else list(root.modules())
         for child in candidates:
             if type(child) is nn.Linear:
