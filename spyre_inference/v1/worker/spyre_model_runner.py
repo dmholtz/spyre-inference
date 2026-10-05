@@ -1372,15 +1372,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # count, which changes the device layout the classifier/embed heads guard
         # on -- so warming needs that same gather-then-slice, not a freshly
         # allocated tensor.
-        for real_width in range(1, min(self.scheduler_config.max_num_seqs, rows) + 1):
-            idx, n_rows = pad_row_count_to_bucket(torch.zeros(real_width, dtype=torch.int64))
-            pooled = select_rows(hidden_states, idx)
-            pooled = pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
-            for head in classifier_heads:
-                self._warm_classifier_head_kernel(head.classifier, pooled, head.activation)
-            for head in embed_heads:
-                if head.activation is not None:
-                    head.activation(pooled)
+        if classifier_heads or embed_heads:
+            for real_width in range(1, min(self.scheduler_config.max_num_seqs, rows) + 1):
+                idx, n_rows = pad_row_count_to_bucket(torch.zeros(real_width, dtype=torch.int64))
+                pooled = select_rows(hidden_states, idx)
+                pooled = pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
+                for head in classifier_heads:
+                    self._warm_classifier_head_kernel(head.classifier, pooled, head.activation)
+                for head in embed_heads:
+                    if head.activation is not None:
+                        head.activation(pooled)
         for token_pooler in token_poolers:
             self._warm_token_pool_widths(token_pooler, hidden_states)
 
