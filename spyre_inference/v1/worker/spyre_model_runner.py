@@ -59,6 +59,7 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -567,6 +568,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Warmup only; see _warm_encoder_inline_paths.
         self._forced_encoder_rect: tuple[int, int] | None = None
         self._force_encoder_ragged = False
+        self._encoder_causal = False
         self.spyre_encoder_rect_steps = 0
         self.spyre_encoder_ragged_steps = 0
         self.spyre_encoder_real_tokens = 0
@@ -674,6 +676,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
                 self.model, self._spyre_device, encoder_len_ladder(self.vllm_config)
+            )
+            # A causal tower (e.g. CLIP text) patched onto the encoder backend needs
+            # causal masks on its attention plans.
+            self._encoder_causal = any(
+                getattr(m.impl, "causal", False)
+                for m in self.model.modules()
+                if isinstance(m, Attention)
+                and m.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
             )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
@@ -1129,6 +1139,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         # Grouping only pays off through the compiled kernels; the
                         # eager per-request loop has no launch overhead to amortise.
                         batched=self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE,
+                        causal=self._encoder_causal,
                     )
                     encoder_md.encoder_plan = plan
                 else:
@@ -1173,7 +1184,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             extent=extent,
             width=width,
             mask=convert(
-                encoder_key_pad_mask(extent, [extent] * width, self._model_dtype()),
+                encoder_key_pad_mask(
+                    extent, [extent] * width, self._model_dtype(), self._encoder_causal
+                ),
                 self._spyre_device,
             ),
             query_lens=[extent] * width,
