@@ -1378,10 +1378,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 pooled = select_rows(hidden_states, idx)
                 pooled = pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
                 for head in classifier_heads:
-                    self._warm_classifier_head_kernel(head.classifier, pooled, head.activation)
-                for head in embed_heads:
+                    logits = head.classifier(pooled)
                     if head.activation is not None:
-                        head.activation(pooled)
+                        head.activation(logits)
+                for head in embed_heads:
+                    embeddings = head.projector(pooled) if head.projector is not None else pooled
+                    if head.activation is not None:
+                        head.activation(embeddings)
         for token_pooler in token_poolers:
             self._warm_token_pool_widths(token_pooler, hidden_states)
 
@@ -1393,17 +1396,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         lens = convert(torch.ones(width, 1, dtype=torch.float32), device)
         prod = _mean_pool_mask_mul(mask, hidden_states).clone()
         _mean_pool_fp32_reduce(prod, lens)
-
-    def _warm_classifier_head_kernel(
-        self,
-        classifier: nn.Module,
-        x: torch.Tensor,
-        activation: nn.Module | None,
-    ) -> None:
-        """Compile the pooler's classifier kernel (and its activation) at ``x``'s row width."""
-        logits = classifier(x)
-        if activation is not None:
-            activation(logits)
 
     def _warm_token_pool_widths(
         self, token_pooler: SpyreTokenPooler, hidden_states: torch.Tensor
@@ -1428,6 +1420,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 continue
             classifier = getattr(head, "classifier", None)
             logits = classifier(chunk) if classifier is not None else chunk
+            projector = getattr(head, "projector", None)
+            if projector is not None:
+                logits = projector(logits)
             activation = getattr(head, "activation", None)
             if activation is not None:
                 activation(logits)

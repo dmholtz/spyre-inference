@@ -204,12 +204,9 @@ def _mean_pool_mask_mul(indicator: torch.Tensor, hidden_states: torch.Tensor) ->
 def _mean_pool_fp32_reduce(prod: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
     """fp32 round-trip sum (torch-spyre#2619): upcast, sum, divide, downcast in one graph.
 
-    The fp32 intermediate never crosses a device-program boundary here, so it
-    never has to be read back or converted on its own -- only the upcast and
-    the downcast at the graph's edges, both fp16-facing. That is what avoids
-    torch-spyre#2971 (an addressable device fp32 tensor is staggered and
-    unsafe to ``convert``/cast directly): this kernel produces fp16 in, fp16
-    out, with the actual accumulation happening in fp32 in between.
+    fp16 in, fp16 out, with the accumulation happening in fp32 in between; see
+    ``SpyreMeanPool`` for why that round-trip is needed instead of a plain
+    device fp32 sum or an fp16-accumulator matmul.
     """
     total = prod.to(torch.float32).sum(dim=1)
     return (total / lens).to(prod.dtype)
@@ -474,6 +471,15 @@ def prepare_fp32_head_for_spyre(
         model.head_dtype = torch.float16
 
 
+def _match_weight(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Convert ``x`` to ``weight``'s device/dtype, via the host for a Spyre target."""
+    if x.device == weight.device and x.dtype == weight.dtype:
+        return x
+    if weight.device.type == "spyre":
+        return convert(x, weight.device, weight.dtype)
+    return x.to(device=weight.device, dtype=weight.dtype)
+
+
 class SpyreClassifierLinear(nn.Linear):
     """Classifier Linear: decoder-style ``x @ Wᵀ`` on Spyre, bias in the same op.
 
@@ -501,11 +507,7 @@ class SpyreClassifierLinear(nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         weight = self.weight
-        if input.device != weight.device or input.dtype != weight.dtype:
-            if weight.device.type == "spyre":
-                input = convert(input, weight.device, weight.dtype)
-            else:
-                input = input.to(device=weight.device, dtype=weight.dtype)
+        input = _match_weight(input, weight)
         return spyre_linear_t(input, weight, self.bias, pad_rows=True)
 
 
@@ -533,7 +535,6 @@ def _roberta_classifier_head_kernel(
     return out
 
 
-# Flags a mid-request recompile below, which otherwise just adds latency silently.
 compile_guard.watch(_roberta_classifier_head_kernel, "roberta classifier head")
 
 
@@ -557,12 +558,7 @@ class SpyreRobertaClassificationHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dense, out_proj = self.dense, self.out_proj
-        weight = dense.weight
-        if x.device != weight.device or x.dtype != weight.dtype:
-            if weight.device.type == "spyre":
-                x = convert(x, weight.device, weight.dtype)
-            else:
-                x = x.to(device=weight.device, dtype=weight.dtype)
+        x = _match_weight(x, dense.weight)
         return _roberta_classifier_head_kernel(
             x, dense.weight, dense.bias, out_proj.weight, out_proj.bias
         )
