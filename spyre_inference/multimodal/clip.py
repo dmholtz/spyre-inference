@@ -35,8 +35,68 @@ import torch
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
+
+# Mixed image+text steps: vLLM 0.28's CLIPEmbeddingModel treats a step holding any
+# image as image-only, so its text requests skip the text tower. Backport of
+# vllm-project/vllm#53165 (in vLLM >= 0.29). Remove this, and the packed-path rule
+# in TorchSpyreModelRunner._step_has_mm_inputs, once the vLLM pin reaches 0.29.
+
+
+def _has_mm(multimodal_embeddings) -> bool:
+    return multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+
+
+def has_text_tokens(multimodal_embeddings, is_multimodal: torch.Tensor | None) -> bool:
+    """Whether the step still has text rows to run through the text tower."""
+    has_mm = _has_mm(multimodal_embeddings)
+    if not has_mm or is_multimodal is None:
+        return not has_mm
+    return bool((~convert(is_multimodal, device="cpu")).any())
+
+
+def merge_text_and_vision(
+    text: torch.Tensor, vision: torch.Tensor, is_multimodal: torch.Tensor | None
+) -> torch.Tensor:
+    """Text-tower output on text rows, the vision embedding on image rows."""
+    if is_multimodal is None:
+        return text
+    src = convert(is_multimodal, device="cpu")[: text.shape[0]]
+    if not bool(src.any()):
+        return text
+    mask = torch.zeros(text.shape[0], dtype=torch.bool)
+    mask[: src.shape[0]] = src
+    return torch.where(convert(mask, device=text.device).unsqueeze(-1), vision, text)
+
+
+def patch_mixed_batches() -> None:
+    from vllm.model_executor.models.clip import CLIPEmbeddingModel
+
+    if getattr(CLIPEmbeddingModel.forward, "_spyre_patched", False):
+        return
+    orig_embed_input_ids = CLIPEmbeddingModel.embed_input_ids
+    orig_forward = CLIPEmbeddingModel.forward
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        out = orig_embed_input_ids(
+            self, input_ids, multimodal_embeddings, is_multimodal=is_multimodal
+        )
+        self._spyre_mm_token_mask = is_multimodal if _has_mm(multimodal_embeddings) else None
+        self._is_text_input = has_text_tokens(multimodal_embeddings, is_multimodal)
+        return out
+
+    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kw):
+        out = orig_forward(self, input_ids, positions, intermediate_tensors, inputs_embeds, **kw)
+        mask = getattr(self, "_spyre_mm_token_mask", None)
+        if self._is_text_input and mask is not None and inputs_embeds is not None:
+            out = merge_text_and_vision(out, inputs_embeds, mask)
+        return out
+
+    forward._spyre_patched = True
+    CLIPEmbeddingModel.embed_input_ids = embed_input_ids  # ty: ignore[invalid-assignment]
+    CLIPEmbeddingModel.forward = forward  # ty: ignore[invalid-assignment]
 
 
 def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.nn.LayerNorm:
@@ -62,6 +122,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     keep this a no-op (rather than an ``AttributeError`` on ``normalized_shape``)
     for any boundary norm that isn't a plain ``nn.LayerNorm``.
     """
+    patch_mixed_batches()
     text_model = getattr(model, "text_model", None)
     if text_model is not None:
         ln = getattr(text_model, "final_layer_norm", None)

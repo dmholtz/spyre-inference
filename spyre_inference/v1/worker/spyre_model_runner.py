@@ -1116,7 +1116,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # before the bucketer is warmed. Those take the packed path, which works at
         # any row count.
         rectangles = self._encoder_rectangles if rows == self._encoder_budget else []
-        if self._force_encoder_ragged:
+        if self._force_encoder_ragged or self._step_has_mm_inputs():
             rectangles = []
 
         per_layer = out[0] if isinstance(out, tuple) else out
@@ -1167,6 +1167,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     rows,
                 )
         return out
+
+    def _step_has_mm_inputs(self) -> bool:
+        """True when a request in this step carries multimodal input.
+
+        CLIP's mixed-batch merge (``multimodal/clip.py``) applies its token mask in
+        packed order, so such steps take the packed path. Remove with that backport.
+        """
+        return self.supports_mm_inputs and any(
+            self.requests[req_id].mm_features for req_id in self.input_batch.req_ids
+        )
 
     def _forced_encoder_plan(self):
         """Warmup's declared rectangle, ignoring the dummy batch's own shape.
