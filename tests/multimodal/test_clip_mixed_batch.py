@@ -12,15 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for CLIP's mixed image+text step workaround (``multimodal/clip.py``)."""
+"""CPU tests for CLIP's batching workarounds in ``multimodal/clip.py``."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from spyre_inference.multimodal.clip import has_text_tokens, merge_text_and_vision
+from spyre_inference.multimodal.clip import (
+    has_text_tokens,
+    merge_text_and_vision,
+    select_class_rows,
+)
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 
@@ -55,6 +60,12 @@ def test_merge_pads_a_short_mask_with_text_rows():
 def test_merge_without_image_rows_returns_text():
     text = torch.randn(3, 2)
     assert merge_text_and_vision(text, torch.ones(3, 2), torch.zeros(3, dtype=torch.bool)) is text
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+def test_select_class_rows_matches_the_class_token_slice(batch):
+    feats = torch.randn(batch, 50, 8)
+    assert torch.equal(select_class_rows(feats), feats[:, :1, :])
 
 
 def _runner(features_by_req: dict[str, list], supports_mm_inputs: bool = True):

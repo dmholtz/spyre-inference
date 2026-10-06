@@ -248,5 +248,44 @@ def test_clip_mixed_image_text_step_matches_each_request_alone():
         assert cos > 0.999, f"{name}: mixed-step embedding differs from alone (cosine {cos:.4f})"
 
 
+@pytest.mark.multimodal
+@pytest.mark.uses_subprocess
+def test_clip_batched_images_match_hf():
+    """Several images in one step each embed to their own HF reference.
+
+    Past one image, the class token was a strided slice the on-card post-norm misread,
+    so every image after the first came back wrong.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+    import numpy as np
+    import torch
+    from huggingface_hub import try_to_load_from_cache
+    from PIL import Image
+    from transformers import CLIPModel, CLIPProcessor
+    from vllm import LLM
+
+    if not isinstance(try_to_load_from_cache(CLIP_MODEL, "config.json"), str):
+        pytest.skip(f"{CLIP_MODEL} not in the local HF cache")
+
+    rng = np.random.default_rng(0)
+    images = [
+        Image.fromarray(rng.integers(0, 256, (7, 7, 3), dtype=np.uint8)).resize((224, 224))
+        for _ in range(4)
+    ]
+    hf = CLIPModel.from_pretrained(CLIP_MODEL).eval()
+    pixels = CLIPProcessor.from_pretrained(CLIP_MODEL)(images=images, return_tensors="pt")
+    with torch.no_grad():
+        ref = hf.get_image_features(**pixels)
+    ref = getattr(ref, "pooler_output", ref)
+
+    llm = LLM(model=CLIP_MODEL, runner="pooling", max_model_len=77, max_num_seqs=4)
+    outputs = llm.embed([{"prompt": "", "multi_modal_data": {"image": im}} for im in images])
+
+    for i, (out, r) in enumerate(zip(outputs, ref)):
+        cos = torch.nn.functional.cosine_similarity(torch.tensor(out.outputs.embedding), r, dim=0)
+        assert cos.item() > 0.999, f"image {i}: cosine {cos.item():.4f} vs HF"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

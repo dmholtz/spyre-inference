@@ -36,6 +36,7 @@ from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.pool.spyre_pooler import select_rows
 
 logger = init_logger(__name__)
 
@@ -99,6 +100,41 @@ def patch_mixed_batches() -> None:
     CLIPEmbeddingModel.forward = forward  # ty: ignore[invalid-assignment]
 
 
+def select_class_rows(feats: torch.Tensor) -> torch.Tensor:
+    """Each image's class token, ``feats[:, :1, :]``, gathered rather than sliced.
+
+    Past one image the slice is a strided view, and the on-card post-norm reads it as
+    contiguous: every image after the first got rows of the first image instead.
+    """
+    b, s, h = feats.shape
+    rows = torch.arange(b, dtype=torch.int64) * s
+    return select_rows(feats.reshape(b * s, h), rows).reshape(b, 1, h)
+
+
+def patch_class_token_select() -> None:
+    from vllm.model_executor.models.clip import (
+        CLIPEmbeddingModel,
+        _get_vision_feature_select_strategy,
+    )
+
+    if getattr(CLIPEmbeddingModel.get_image_features, "_spyre_patched", False):
+        return
+    orig = CLIPEmbeddingModel.get_image_features
+
+    def get_image_features(self, pixel_values, feature_select_strategy=None):
+        pooling_type = self.pooler_config.seq_pooling_type
+        if (
+            feature_select_strategy is None
+            and pixel_values.shape[0] > 1
+            and _get_vision_feature_select_strategy(pooling_type) == "class"
+        ):
+            feature_select_strategy = select_class_rows
+        return orig(self, pixel_values, feature_select_strategy)
+
+    get_image_features._spyre_patched = True
+    CLIPEmbeddingModel.get_image_features = get_image_features  # ty: ignore[invalid-assignment]
+
+
 def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.nn.LayerNorm:
     new_ln = SpyreLayerNorm(
         list(ln.normalized_shape),
@@ -123,6 +159,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     for any boundary norm that isn't a plain ``nn.LayerNorm``.
     """
     patch_mixed_batches()
+    patch_class_token_select()
     text_model = getattr(model, "text_model", None)
     if text_model is not None:
         ln = getattr(text_model, "final_layer_norm", None)
