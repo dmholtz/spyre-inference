@@ -37,13 +37,14 @@ from vllm.logger import init_logger
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.spyre_pooler import select_rows
+from spyre_inference.v1.worker.spyre_shape_bucketer import expand_packed_embeds_to_encoder_grid
 
 logger = init_logger(__name__)
 
 # Mixed image+text steps: vLLM 0.28's CLIPEmbeddingModel treats a step holding any
 # image as image-only, so its text requests skip the text tower. Backport of
-# vllm-project/vllm#53165 (in vLLM >= 0.29). Remove this, and the packed-path rule
-# in TorchSpyreModelRunner._step_has_mm_inputs, once the vLLM pin reaches 0.29.
+# vllm-project/vllm#53165 (in vLLM >= 0.29). Remove this, and the spyre_align_token_mask
+# call in TorchSpyreModelRunner._preprocess, once the vLLM pin reaches 0.29.
 
 
 def _has_mm(multimodal_embeddings) -> bool:
@@ -97,7 +98,26 @@ def patch_mixed_batches() -> None:
             out = merge_text_and_vision(out, inputs_embeds, mask)
         return out
 
+    def spyre_align_token_mask(self, num_tokens: int, grid) -> None:
+        """Trim the mask to the step's real rows, then lay it out as the grid, if any.
+
+        Padding rows are not text: an image-only step then skips the text tower.
+        """
+        mask = getattr(self, "_spyre_mm_token_mask", None)
+        if mask is None:
+            return
+        mask = convert(mask, device="cpu")[:num_tokens]
+        self._is_text_input = bool((~mask).any())
+        if grid is not None:
+            extent, width, query_lens = grid
+            grid_mask = expand_packed_embeds_to_encoder_grid(
+                mask.unsqueeze(-1), query_lens, width, extent
+            )
+            mask = grid_mask.squeeze(-1)
+        self._spyre_mm_token_mask = mask
+
     forward._spyre_patched = True
+    CLIPEmbeddingModel.spyre_align_token_mask = spyre_align_token_mask
     CLIPEmbeddingModel.embed_input_ids = embed_input_ids  # ty: ignore[invalid-assignment]
     CLIPEmbeddingModel.forward = forward  # ty: ignore[invalid-assignment]
 

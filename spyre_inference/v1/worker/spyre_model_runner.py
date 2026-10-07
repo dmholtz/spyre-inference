@@ -1116,7 +1116,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # before the bucketer is warmed. Those take the packed path, which works at
         # any row count.
         rectangles = self._encoder_rectangles if rows == self._encoder_budget else []
-        if self._force_encoder_ragged or self._step_has_mm_inputs():
+        if self._force_encoder_ragged:
             rectangles = []
 
         per_layer = out[0] if isinstance(out, tuple) else out
@@ -1167,16 +1167,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     rows,
                 )
         return out
-
-    def _step_has_mm_inputs(self) -> bool:
-        """True when a request in this step carries multimodal input.
-
-        CLIP's mixed-batch merge (``multimodal/clip.py``) applies its token mask in
-        packed order, so such steps take the packed path. Remove with that backport.
-        """
-        return self.supports_mm_inputs and any(
-            self.requests[req_id].mm_features for req_id in self.input_batch.req_ids
-        )
 
     def _forced_encoder_plan(self):
         """Warmup's declared rectangle, ignoring the dummy batch's own shape.
@@ -1461,11 +1451,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
+        # A model that masks multimodal rows after embedding (CLIP, multimodal/clip.py)
+        # needs its mask in the same row layout as the embeddings.
+        align_token_mask = getattr(self.model, "spyre_align_token_mask", None)
         if grid is None:
+            if align_token_mask is not None:
+                scheduler_output = args[0] if args else kwargs["scheduler_output"]
+                align_token_mask(scheduler_output.total_num_scheduled_tokens, None)
             return self._offset_preprocess_positions(out)
         input_ids, inputs_embeds, positions, *rest = out
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
+        if align_token_mask is not None:
+            align_token_mask(num_tokens, grid)
         hf_config = getattr(self.model_config, "hf_config", None)
         position_offset = roberta_position_delta(hf_config)
 

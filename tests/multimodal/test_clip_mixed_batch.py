@@ -25,9 +25,9 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 from spyre_inference.multimodal.clip import (
     has_text_tokens,
     merge_text_and_vision,
+    patch_mixed_batches,
     select_class_rows,
 )
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 
 def test_text_only_step_runs_text_tower():
@@ -85,21 +85,30 @@ def test_select_class_rows_matches_the_class_token_slice(batch):
     assert torch.equal(select_class_rows(feats), feats[:, :1, :])
 
 
-def _runner(features_by_req: dict[str, list], supports_mm_inputs: bool = True):
-    return SimpleNamespace(
-        supports_mm_inputs=supports_mm_inputs,
-        input_batch=SimpleNamespace(req_ids=list(features_by_req)),
-        requests={r: SimpleNamespace(mm_features=f) for r, f in features_by_req.items()},
-    )
+def _align(mask: torch.Tensor, num_tokens: int, grid=None) -> SimpleNamespace:
+    from vllm.model_executor.models.clip import CLIPEmbeddingModel
+
+    patch_mixed_batches()
+    model = SimpleNamespace(_spyre_mm_token_mask=mask, _is_text_input=True)
+    CLIPEmbeddingModel.spyre_align_token_mask(model, num_tokens, grid)
+    return model
 
 
-def test_step_with_an_image_request_takes_the_packed_path():
-    runner = _runner({"text": [], "image": [object()]})
-    assert TorchSpyreModelRunner._step_has_mm_inputs(runner)
+def test_padding_rows_do_not_count_as_text():
+    # Two image rows, then bucket padding: the step is image-only.
+    model = _align(torch.tensor([True, True, False, False]), num_tokens=2)
+    assert model._is_text_input is False
+    assert torch.equal(model._spyre_mm_token_mask, torch.tensor([True, True]))
 
 
-def test_text_only_step_keeps_the_rectangle():
-    assert not TorchSpyreModelRunner._step_has_mm_inputs(_runner({"a": [], "b": []}))
-    assert not TorchSpyreModelRunner._step_has_mm_inputs(
-        _runner({"image": [object()]}, supports_mm_inputs=False)
-    )
+def test_a_real_text_row_keeps_the_text_tower():
+    model = _align(torch.tensor([True, False, False, False]), num_tokens=3)
+    assert model._is_text_input is True
+
+
+def test_mask_is_laid_out_like_the_grid():
+    # Packed: text (2 rows), then image (1 row). Grid extent 4: request i starts at 4*i,
+    # so the image row moves from packed row 2 to grid row 4.
+    model = _align(torch.tensor([False, False, True, False]), 3, grid=(4, 2, [2, 1]))
+    expected = torch.tensor([False, False, False, False, True, False, False, False])
+    assert torch.equal(model._spyre_mm_token_mask, expected)
