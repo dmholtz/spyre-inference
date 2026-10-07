@@ -69,7 +69,9 @@ def merge_text_and_vision(
         return text
     mask = torch.zeros(text.shape[0], dtype=torch.bool)
     mask[: src.shape[0]] = src
-    return torch.where(convert(mask, device=text.device).unsqueeze(-1), vision, text)
+    # Unsqueezed on the host: a device-side [N, 1] view gives the result a layout that
+    # index_select faults the card on past row 63 (torch-spyre#5230).
+    return torch.where(convert(mask.unsqueeze(-1), device=text.device), vision, text)
 
 
 def patch_mixed_batches() -> None:

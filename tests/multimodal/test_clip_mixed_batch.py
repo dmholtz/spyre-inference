@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.multimodal.clip import (
     has_text_tokens,
@@ -60,6 +61,22 @@ def test_merge_pads_a_short_mask_with_text_rows():
 def test_merge_without_image_rows_returns_text():
     text = torch.randn(3, 2)
     assert merge_text_and_vision(text, torch.ones(3, 2), torch.zeros(3, dtype=torch.bool)) is text
+
+
+def test_merge_output_keeps_the_standard_device_layout():
+    """A device-side [N, 1] mask view gave torch.where's output a layout that index_select
+    faults the card on past row 63 (torch-spyre#5230).
+
+    Checks the layout only, never gathers, so it cannot fault the card.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    text = torch.randn(512, 512, dtype=torch.float16).to("spyre")
+    vision = torch.randn(512, 512, dtype=torch.float16).to("spyre")
+    mask = torch.zeros(512, dtype=torch.bool)
+    mask[[0, 100]] = True
+    out = merge_text_and_vision(text, vision, mask)
+    assert out.device_tensor_layout().stride_map == text.device_tensor_layout().stride_map
 
 
 @pytest.mark.parametrize("batch", [1, 3])
