@@ -19,6 +19,19 @@ sub-stick `copy_from_d2d` expression torch-spyre cannot lay out for patch grids
 coprime with the 64-wide stick. So run the real `F.conv2d` on-card instead, with
 the weight and input placed into explicit `SpyreTensorLayout`s. Layout tuples are
 derived from shapes, so any out-channel count and image size work.
+
+For shapes where those tiled layouts do not apply (batch > 1, C_in > 64, or
+out_channels not a multiple of 64) a fallback path is used.  The fallback was
+previously ``F.conv2d`` on device, which decomposes via ``conv2d_via_bmm_decomp``
+into three independent host round trips (spyre::unfold for the activation plus
+spyre::reshape_via_cpu for weight and bias).
+
+Strategy C eliminates the weight and bias round trips by pre-computing and
+placing them on device once in ``process_weights_after_loading``.  At inference
+the fallback path calls ``spyre::unfold`` (the single inescapable activation
+round trip) and then a compiled on-device matmul + bias-add using the
+pre-placed ``_w_2d_dev`` / ``_bias_3d_dev`` tensors, reducing three host round
+trips to one.
 """
 
 import torch
@@ -95,6 +108,10 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._w_dev: torch.Tensor | None = None
+        # Strategy C: pre-placed fallback weight/bias (populated by
+        # process_weights_after_loading for shapes outside _layouts_supported).
+        self._w_2d_dev: torch.Tensor | None = None
+        self._bias_3d_dev: torch.Tensor | None = None
 
     @maybe_compile
     def _conv_native(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
@@ -108,12 +125,69 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             groups=self.groups,
         )
 
+    @maybe_compile
+    def _conv_via_matmul(
+        self,
+        patches: torch.Tensor,
+        w_2d: torch.Tensor,
+        bias_3d: torch.Tensor | None,
+        h_out: int,
+        w_out: int,
+    ) -> torch.Tensor:
+        """On-device matmul + bias-add for the pre-loaded fallback path.
+
+        ``patches``  : (N, C_in*K1*K2, H_out*W_out)  — output of spyre::unfold
+        ``w_2d``     : (C_out, C_in*K1*K2)            — pre-reshaped at load time
+        ``bias_3d``  : (1, C_out, 1) or None          — pre-reshaped at load time
+        ``h_out``, ``w_out``: output spatial dims (static per compile graph)
+
+        Returns (N, C_out, H_out, W_out).
+        """
+        N = patches.shape[0]
+        # Broadcast weight over batch: (1, C_out, C_in*K) -> (N, C_out, C_in*K).
+        # clone() materialises the expand so the matmul sees a contiguous layout.
+        out = torch.matmul(w_2d.unsqueeze(0).expand(N, -1, -1).clone(), patches)
+        # out: (N, C_out, H_out*W_out)
+        if bias_3d is not None:
+            out = out + bias_3d
+        return out.reshape(N, self.out_channels, h_out, w_out)
+
     def process_weights_after_loading(self) -> None:
-        """Place the patch-conv weight into its tiled layout once after model load."""
-        if self._w_dev is not None or self.weight.device.type != "spyre":
+        """Place conv weights into their tiled / pre-reshaped layouts once after load.
+
+        Happy path (``_layouts_supported``): places the weight into the tiled
+        ``_weight_layout`` as before.
+
+        Fallback path (shapes outside ``_layouts_supported``): additionally
+        pre-reshapes weight to ``(C_out, C_in*K1*K2)`` and bias to
+        ``(1, C_out, 1)`` and places them on device.  At inference these are
+        passed directly to the compiled matmul, eliminating the per-step
+        ``spyre::reshape_via_cpu`` round trips that ``conv2d_via_bmm_decomp``
+        would otherwise emit for weight and bias (Strategy C).
+        """
+        if self.weight.device.type != "spyre":
             return
-        w_cpu = convert(self.weight.detach(), device="cpu")
-        self._w_dev = convert(w_cpu, device="spyre", device_layout=_weight_layout(w_cpu))
+
+        # Happy-path weight (tiled layout for on-card F.conv2d).
+        if self._w_dev is None:
+            w_cpu = convert(self.weight.detach(), device="cpu")
+            self._w_dev = convert(w_cpu, device="spyre", device_layout=_weight_layout(w_cpu))
+
+        # Fallback-path weight + bias (flat 2D / 3D, default layout).
+        # groups == 1 is the only case conv2d_via_bmm_decomp's non-depthwise branch
+        # handles; depthwise (C_in == groups == C_out) routes to spyre::conv2d_with_bias
+        # and never reaches this code path.
+        if self._w_2d_dev is None and self.groups == 1:
+            C_out, C_in, K1, K2 = self.weight.shape
+            w_cpu = convert(self.weight.detach(), device="cpu")
+            self._w_2d_dev = convert(
+                w_cpu.reshape(C_out, C_in * K1 * K2), device="spyre"
+            )
+            if self.bias is not None and self._bias_3d_dev is None:
+                b_cpu = convert(self.bias.detach(), device="cpu")
+                self._bias_3d_dev = convert(
+                    b_cpu.reshape(1, C_out, 1), device="spyre"
+                )
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
@@ -127,10 +201,34 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             logger.warning_once(
                 "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
                 "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
-                "falling back to F.conv2d without them.",
+                "falling back to im2col+matmul with pre-loaded weight.",
                 tuple(x.shape),
                 tuple(self.weight.shape),
             )
+            if self._w_2d_dev is not None:
+                # Strategy C: weight and bias were placed on device at load time.
+                # Only the activation needs a host round trip (spyre::unfold).
+                _, _, H_in, W_in = x.shape
+                K1, K2 = self.kernel_size
+                S1, S2 = self.stride
+                P1, P2 = self.padding
+                D1, D2 = self.dilation
+                H_out = (H_in + 2 * P1 - D1 * (K1 - 1) - 1) // S1 + 1
+                W_out = (W_in + 2 * P2 - D2 * (K2 - 1) - 1) // S2 + 1
+                patches = torch.ops.spyre.unfold(
+                    x,
+                    kernel_size=self.kernel_size,
+                    dilation=self.dilation,
+                    padding=self.padding,
+                    stride=self.stride,
+                )
+                return self._conv_via_matmul(
+                    patches, self._w_2d_dev, self._bias_3d_dev, H_out, W_out
+                )
+            # _w_2d_dev is None only before process_weights_after_loading has run
+            # (e.g. a CPU-device forward during model construction) or for grouped
+            # convs where the fallback pre-load is not implemented.  Route through
+            # aten.convolution so conv2d_via_bmm_decomp handles it.
             return self._forward_conv(x)
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
