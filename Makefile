@@ -389,8 +389,8 @@ coverage: ## Combine COVERAGE=1 data (COVERAGE_DATA=dir) into report + coverage.
 # WITHOUT torch, so every benchmark then dies with "No module named 'torch'".
 # No combination of --active/--no-sync/--frozen/--inexact/--no-project avoids
 # this. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv entirely and invoke the
-# already-activated venv's python3 directly (the setup sourced above exports
-# $VIRTUAL_ENV, so plain python3 is the baked interpreter). Empty/unset keeps
+# active venv's python3 directly (AIU_SETUP_CMD prefers the project .venv when
+# present, otherwise keeping the profile-selected venv). Empty/unset keeps
 # the uv path, correct on arches with a resolvable lockfile (amd64, ppc64le).
 SKIP_UV_FOR_BENCHMARKING ?=
 ifeq ($(strip $(SKIP_UV_FOR_BENCHMARKING)),)

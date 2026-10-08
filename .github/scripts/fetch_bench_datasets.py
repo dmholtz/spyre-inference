@@ -29,10 +29,9 @@ skewing a benchmark.
 
 The cache dir is usually shared and writable by many jobs at once (on x86 it is
 a ReadWriteMany PVC mounted into every runner pod), so a fetch takes an
-exclusive lock per file and re-checks the cache after acquiring it. Concurrent
-jobs therefore download a given trace once, and readers only ever see a
-complete file because the download lands on a `.part` sibling and is renamed
-into place after its digest is verified.
+exclusive lock per file and re-checks the cache after acquiring it. Cross-pod
+deduplication depends on NFS locking (see ``file_lock``). Downloads land on a
+`.part` sibling and are renamed into place only after digest verification.
 
 Eval the output to set the vars the configs reference:
 

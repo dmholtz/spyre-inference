@@ -109,7 +109,7 @@ on:
       skip_uv_for_benchmarking:
         description: |
           Perf job only. When true, the benchmark runner bypasses `uv run` and
-          calls the prebaked venv's python3 directly (make ... TEST_TYPE=perf
+          calls the active venv's python3 directly (make ... TEST_TYPE=perf
           SKIP_UV_FOR_BENCHMARKING=1). Needed on arches where uv re-resolves the
           project and cannot find a torch/vllm wheel (s390x: torch==2.11.0 has no
           s390x wheel), so uv builds a fresh venv without torch and every
@@ -133,8 +133,8 @@ on:
       ARTIFACTORY_RPM_PATH:
         required: false
       # Artifactory root that fetch_bench_datasets.py resolves artifact paths
-      # against, the vLLM benchmark traces among them. A run without it fails
-      # naming the variable rather than measuring nothing.
+      # against. Needed only for missing/corrupt traces; fetch failures warn,
+      # and selected configs fail if their required trace remains absent.
       ARTIFACTORY_DATA_PATH:
         required: false
       # ClickHouse connection for the perf job's benchmark ingest. A run without
@@ -1089,8 +1089,8 @@ jobs:
       # The serve configs replay trace files that are not in the repo. Cache
       # them on the same RWX volume as the HuggingFace cache above: it outlives
       # the pod, so the first job to need a trace fetches it and every later job
-      # on any runner reads it from the volume. fetch_bench_datasets.py locks
-      # per file, so concurrent jobs fetch a given trace once.
+      # on any runner reads it from the volume. Per-file locks reduce duplicate
+      # fetches; cross-pod deduplication depends on NFS locking.
       SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
       ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
       ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
@@ -1170,7 +1170,7 @@ jobs:
       - name: Run vLLM benchmarks
         id: bench
         env:
-          # true -> "1" (bypass uv, use the baked venv's python3 directly),
+          # true -> "1" (bypass uv, use the active venv's python3 directly),
           # false -> "" (keep the uv path). The Makefile treats empty as "use uv".
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
           # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).

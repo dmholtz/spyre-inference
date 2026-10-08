@@ -27,7 +27,7 @@ on:
         type: string
       skip_uv_for_benchmarking:
         description: >
-          Bypass `uv run` and use the prebaked venv's python3 directly. Needed
+          Bypass `uv run` and use the active venv's python3 directly. Needed
           on s390x, where uv cannot resolve a torch/vllm wheel and otherwise
           builds a torch-less venv. Leave false on amd64/ppc64le.
         required: false
@@ -122,8 +122,8 @@ jobs:
       # that is mounted into every runner pod at /storage-1, alongside the uv and
       # HuggingFace caches this repo already keeps there. It survives the pod, so
       # the first job to need a trace fetches it and every later job on any runner
-      # reads it straight off the PVC. fetch_bench_datasets.py locks per file, so
-      # concurrent matrix jobs fetch a given trace once.
+      # reads it straight off the PVC. Per-file locks reduce duplicate fetches;
+      # cross-pod deduplication depends on NFS locking.
       STORAGE_1_DIR: /storage-1/spyre-inference
       SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
       ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}

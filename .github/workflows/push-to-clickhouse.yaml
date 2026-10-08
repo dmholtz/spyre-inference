@@ -157,9 +157,8 @@ jobs:
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
-      # Download every artifact from the triggering run and unzip it — artifact
-      # *names* carry no file extension (only the file inside the zip does), so
-      # filtering has to happen post-unzip by actual filename, not by artifact name.
+      # Download and unzip only junit-* artifacts and the run-id/artifact-id
+      # sidecars, filtering by artifact name before downloading.
       #
       # `--paginate` is required: the artifacts endpoint defaults to 30 per
       # page, and a run with more jobs than that silently lost every artifact
@@ -231,7 +230,7 @@ jobs:
       - name: Resolve threaded run_id
         id: resolve-run-id
         run: |
-          # _test_matrix.yaml uploads it as "run-id"; it rides in with the XML downloaded above.
+          # _test_matrix.yaml or integration-tests.yaml uploads "run-id", downloaded with the XML.
           RID="$(tr -d '[:space:]' < xml_artifacts/run-id/run-id.txt 2>/dev/null || true)"
           echo "Threaded run_id: ${RID:-<none, ingest will derive from the run coordinate>}"
           echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"

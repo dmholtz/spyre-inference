@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared JUnit result-tagging helpers for both the tests/conftest.py autouse
-fixture and this plugin's collection hook (which tags upstream vLLM tests,
-collected outside tests/ where the fixture never binds).
+"""Shared JUnit result-tagging helpers for the collection hooks in
+tests/conftest.py (local tests) and this plugin (upstream vLLM tests).
 
 Tags emit as JUnit `<property name="tag" value="key__value"/>`, the convention
 the ClickHouse ingest reads.

@@ -47,9 +47,10 @@ else:
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
-# accepted only when asked for explicitly. Both are 2 bytes wide, so every
-# stick-alignment constant in this plugin holds for either.
+# Dtypes torch-spyre can run. float16 is the validated one; bfloat16 passes this check, but
+# apply_config_platform_defaults overwrites every model's dtype with float16, an explicit
+# --dtype bfloat16 included, so only a config edited after construction reaches it. Both are
+# 2 bytes wide, so every stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -338,8 +339,8 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
-        # This must be set here as the default, otherwise all usage (including test fixtures) would
-        # require setting the dtype.
+        # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
+        # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
 
     @classmethod
@@ -465,14 +466,14 @@ class TorchSpyrePlatform(CpuPlatform):
         the KV cache allocated at the native ``get_head_size()``, which the device copy
         requires to be stick-aligned.
 
-        Two independent restickify failures share this hook, at different widths:
-        RoPE models pad to the next 128-multiple (the failure is RoPE-induced, so
-        non-RoPE decoders like OPT/GPT-2 lower fine at head=64 and are skipped).
-        Pooling/encoder-only models (BERT/RoBERTa) have no RoPE, so theirs is the
-        plain sub-stick failure (e.g. head_size=32 sharing a stick between two
-        heads) -- the next 64-multiple is enough, applied via the construction
-        patch in ``spyre_inference.custom_ops.bert_head_pad`` (the generic
-        property-shim doesn't work on BertSelfAttention's own assert).
+        RoPE and pooling models pad to the next 64-multiple: a sub-stick head (e.g.
+        head_size=32 sharing a stick between two heads) cannot lower, while
+        SpyreRotaryEmbedding handles a sub-stick half (head_size=64). The Transformers
+        backend's RoPE views a head as two halves, so there RoPE models pad to the next
+        128-multiple. Non-RoPE generative decoders (OPT/GPT-2) are skipped; pooling
+        models also go through the construction patch in
+        ``spyre_inference.custom_ops.bert_head_pad`` (the generic property-shim doesn't
+        work on BertSelfAttention's own assert).
 
         No-op for models whose head_dim is already a multiple of the applicable size.
         """
@@ -499,7 +500,7 @@ class TorchSpyrePlatform(CpuPlatform):
         )
         has_rope = any(getattr(c, "rope_parameters", None) for c in cfgs)
         if has_rope:
-            multiple = 128
+            multiple = 128 if model_config.using_transformers_backend() else 64
         elif cls._is_pooling_model(vllm_config):
             multiple = 64
         else:
