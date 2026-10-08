@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 
@@ -33,12 +35,15 @@ def align_up(n: int, align: int = STICK) -> int:
 # Attribute under which a source mask caches its padded counterpart `(key, padded)`.
 _MASK_ATTR = "_spyre_padded_mask"
 
+# Separate attribute used by ``_clip_attn_mask_op`` so it does not collide with
+# ``_padded_attn_mask``'s cache entry on the same key tensor.
+_VISION_MASK_ATTR = "_spyre_vision_attn_mask"
+
 # Per-sequence-length cache key objects used by callers that need a stable handle
-# on which to pin a ``_MASK_ATTR`` cache entry (e.g. ``_build_clip_attn_mask``).
-from functools import lru_cache as _lru_cache
+# on which to attach a cached mask attribute (e.g. ``_clip_attn_mask_op``).
 
 
-@_lru_cache(maxsize=16)
+@lru_cache(maxsize=16)
 def _full_attend_mask_key(seq: int) -> torch.Tensor:
     """Return a stable ``torch.ones(seq, seq)`` object for use as a cache key.
 

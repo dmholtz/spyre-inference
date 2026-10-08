@@ -31,10 +31,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from spyre_inference.multimodal.clip import _compile_vision_encoder_blocks
+from spyre_inference.multimodal.clip import (
+    _compile_vision_encoder_blocks,
+    patch_mm_encoder_attention,
+)
 from spyre_inference.multimodal.clip import apply as apply_clip_patches
-from spyre_inference.multimodal.clip import patch_mm_encoder_attention
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -165,39 +166,75 @@ def test_clip_attn_mask_op_padded_keys_are_neg_inf():
     real_cols = mask[0, 0, :, :q_len]
     pad_cols = mask[0, 0, :, q_len:]
     assert (real_cols == 0).all(), "real key columns should be zero (full-attend)"
-    assert (pad_cols == torch.finfo(torch.float32).min).all(), (
-        "padded key columns should be -inf"
-    )
+    assert (pad_cols == torch.finfo(torch.float32).min).all(), "padded key columns should be -inf"
 
 
 def test_clip_attn_mask_op_is_cached():
     """A second call with the same args must return the exact same tensor object."""
     from spyre_inference.custom_ops.vit_attn import _clip_attn_mask_op
-    from spyre_inference.multimodal.utils import _MASK_ATTR, _full_attend_mask_key
+    from spyre_inference.multimodal.utils import _VISION_MASK_ATTR, _full_attend_mask_key
 
     q_len, seq_pad = 50, 64
     key_tensor = _full_attend_mask_key(q_len)
     try:
         # Clear any prior cached entry so the test is independent.
-        if hasattr(key_tensor, _MASK_ATTR):
-            delattr(key_tensor, _MASK_ATTR)
+        if hasattr(key_tensor, _VISION_MASK_ATTR):
+            delattr(key_tensor, _VISION_MASK_ATTR)
 
         m1 = _clip_attn_mask_op(q_len, 2, seq_pad, torch.float16, torch.device("cpu"))
         m2 = _clip_attn_mask_op(q_len, 2, seq_pad, torch.float16, torch.device("cpu"))
 
         assert m1 is m2
     finally:
-        if hasattr(key_tensor, _MASK_ATTR):
-            delattr(key_tensor, _MASK_ATTR)
+        if hasattr(key_tensor, _VISION_MASK_ATTR):
+            delattr(key_tensor, _VISION_MASK_ATTR)
+
+
+def test_clip_attn_mask_op_different_batch_sizes_do_not_collide():
+    """Different batch sizes on the same q_len must each get their own correctly
+    shaped mask and must not return a stale entry from a previous call."""
+    from spyre_inference.custom_ops.vit_attn import _clip_attn_mask_op
+    from spyre_inference.multimodal.utils import _VISION_MASK_ATTR, _full_attend_mask_key
+
+    q_len, seq_pad = 50, 64
+    key_tensor = _full_attend_mask_key(q_len)
+    try:
+        if hasattr(key_tensor, _VISION_MASK_ATTR):
+            delattr(key_tensor, _VISION_MASK_ATTR)
+
+        m1 = _clip_attn_mask_op(q_len, 1, seq_pad, torch.float16, torch.device("cpu"))
+        m2 = _clip_attn_mask_op(q_len, 2, seq_pad, torch.float16, torch.device("cpu"))
+
+        assert m1.shape == (1, 1, seq_pad, seq_pad)
+        assert m2.shape == (2, 1, seq_pad, seq_pad)
+        # A cache miss on b=2 must not return the b=1 tensor.
+        assert m1 is not m2
+    finally:
+        if hasattr(key_tensor, _VISION_MASK_ATTR):
+            delattr(key_tensor, _VISION_MASK_ATTR)
+
+
+def test_ensure_clip_attn_mask_registered():
+    """``_ensure_clip_attn_mask_registered`` must make the op callable and be
+    idempotent (safe to call multiple times)."""
+    from spyre_inference.custom_ops.vit_attn import _ensure_clip_attn_mask_registered
+
+    _ensure_clip_attn_mask_registered()
+    _ensure_clip_attn_mask_registered()  # second call must not raise
+
+    assert hasattr(torch.ops.vllm, "spyre_clip_attn_mask"), (
+        "torch.ops.vllm.spyre_clip_attn_mask not found after registration"
+    )
+    # Smoke-call the registered op.
+    out = torch.ops.vllm.spyre_clip_attn_mask(50, 1, 64, torch.float32, torch.device("cpu"))
+    assert out.shape == (1, 1, 64, 64)
 
 
 # ---------------------------------------------------------------------------
 # patch_mm_encoder_attention
 # ---------------------------------------------------------------------------
 
-mm_encoder_attn = pytest.importorskip(
-    "vllm.model_executor.layers.attention.mm_encoder_attention"
-)
+mm_encoder_attn = pytest.importorskip("vllm.model_executor.layers.attention.mm_encoder_attention")
 MMEncoderAttention = mm_encoder_attn.MMEncoderAttention
 
 

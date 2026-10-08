@@ -37,22 +37,23 @@ fake impl makes it opaque to Dynamo while remaining fullgraph-compatible
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from spyre_inference.multimodal.utils import _MASK_ATTR, _full_attend_mask_key, padded_sdpa
+from spyre_inference.multimodal.utils import (
+    _VISION_MASK_ATTR,
+    _full_attend_mask_key,
+    padded_sdpa,
+)
 
 logger = init_logger(__name__)
 
 
-@lru_cache(maxsize=8)
-def _full_attend_mask(seq: int) -> torch.Tensor:
-    """Stable per-length mask object so ``padded_sdpa``'s per-mask cache (keyed on
-    this tensor's identity) hits across layers instead of rebuilding every call."""
-    return torch.ones(seq, seq, dtype=torch.bool)
+# Alias: ``padded_sdpa`` caches on the mask object's identity, so we need a stable
+# per-length tensor. ``_full_attend_mask_key`` from utils already provides exactly
+# that (same lru_cache contract, same dtype) — no need for a second copy.
+_full_attend_mask = _full_attend_mask_key
 
 
 def _padded_apply_sdpa(
@@ -90,7 +91,7 @@ def _clip_attn_mask_op(
 
     mask = _full_attend_mask_key(q_len)
     key = (b, q_len, seq_pad, dtype, str(device))
-    cached = getattr(mask, _MASK_ATTR, None)
+    cached = getattr(mask, _VISION_MASK_ATTR, None)
     if cached is not None and cached[0] == key:
         return cached[1]
 
@@ -98,7 +99,7 @@ def _clip_attn_mask_op(
     m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
     m[:, :, :, q_len:] = neg_inf  # padded key positions are never attended
     m = convert(m, device)
-    setattr(mask, _MASK_ATTR, (key, m))
+    setattr(mask, _VISION_MASK_ATTR, (key, m))
     return m
 
 
@@ -111,6 +112,24 @@ def _clip_attn_mask_fake(
 ) -> torch.Tensor:
     """Fake impl for Dynamo shape inference: return a correctly-shaped empty tensor."""
     return torch.empty(b, 1, seq_pad, seq_pad, dtype=dtype, device=device)
+
+
+def _ensure_clip_attn_mask_registered() -> None:
+    """Register the ``spyre_clip_attn_mask`` custom op if not already done.
+
+    Idempotent: safe to call from both ``register()`` and
+    ``patch_mm_encoder_attention()`` so the op is always available before the
+    first compiled forward, regardless of call order.
+    """
+    if hasattr(torch.ops.vllm, "spyre_clip_attn_mask"):
+        return
+    direct_register_custom_op(
+        op_name="spyre_clip_attn_mask",
+        op_func=_clip_attn_mask_op,
+        fake_impl=_clip_attn_mask_fake,
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    logger.debug_once("Registered custom op: spyre_clip_attn_mask")
 
 
 def register() -> None:
@@ -126,10 +145,4 @@ def register() -> None:
         "the 64-element stick before calling SDPA."
     )
 
-    direct_register_custom_op(
-        op_name="spyre_clip_attn_mask",
-        op_func=_clip_attn_mask_op,
-        fake_impl=_clip_attn_mask_fake,
-        dispatch_key="CompositeExplicitAutograd",
-    )
-    logger.debug_once("Registered custom op: spyre_clip_attn_mask")
+    _ensure_clip_attn_mask_registered()

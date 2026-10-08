@@ -199,6 +199,10 @@ def patch_mm_encoder_attention() -> None:
     if getattr(MMEncoderAttention._forward_sdpa, "_spyre_patched", False):
         return
 
+    from spyre_inference.custom_ops.vit_attn import _ensure_clip_attn_mask_registered
+
+    _ensure_clip_attn_mask_registered()
+
     from spyre_inference.multimodal.utils import STICK, align_up
 
     def _spyre_forward_sdpa(
@@ -210,6 +214,10 @@ def patch_mm_encoder_attention() -> None:
     ) -> torch.Tensor:
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
+        assert q_len == kv_len, (
+            f"_spyre_forward_sdpa assumes self-attention (q_len == kv_len) "
+            f"but got q_len={q_len}, kv_len={kv_len}"
+        )
         is_reshaped = query.dim() != 4
 
         query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
@@ -239,9 +247,7 @@ def patch_mm_encoder_attention() -> None:
             k = k.contiguous()
             v = v.contiguous()
 
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, scale=self.scale
-        )
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
 
         if pad_needed:
             out = out[:, :, :q_len, :d]
