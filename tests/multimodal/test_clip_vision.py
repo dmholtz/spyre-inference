@@ -12,15 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for CLIP vision-encoder compilation patches.
-
-Covers:
-- ``_compile_vision_encoder_blocks``: per-block torch.compile wrapping
-- ``_clip_attn_mask_op``: the ``spyre_clip_attn_mask`` custom op
-- ``patch_mm_encoder_attention``: ``MMEncoderAttention._forward_sdpa`` replacement
-
-No Spyre hardware required; all tests run on CPU.
-"""
+"""Tests for CLIP vision-encoder compilation patches. All tests run on CPU."""
 
 from __future__ import annotations
 
@@ -43,7 +35,7 @@ from spyre_inference.multimodal.clip import apply as apply_clip_patches
 
 
 class _FakeEncoderLayer(nn.Module):
-    """Minimal stand-in for CLIPEncoderLayer: a single Linear forward."""
+    """Minimal CLIPEncoderLayer stand-in."""
 
     def __init__(self, hidden: int = 16):
         super().__init__()
@@ -54,10 +46,10 @@ class _FakeEncoderLayer(nn.Module):
 
 
 def _model_with_vision_encoder(num_layers: int = 3, shared: bool = False):
-    """Build a stand-in for CLIPEmbeddingModel with vision_model.encoder.layers."""
+    """Minimal model with ``vision_model.encoder.layers``."""
     layers = [_FakeEncoderLayer() for _ in range(num_layers)]
     if shared:
-        # Simulate PP-style aliasing: every slot points at the same object.
+        # PP-style aliasing: every slot points at the same object.
         layers = [layers[0]] * num_layers
     encoder = types.SimpleNamespace(layers=nn.ModuleList(layers))
     vision_model = types.SimpleNamespace(encoder=encoder)
@@ -70,8 +62,7 @@ def _model_with_vision_encoder(num_layers: int = 3, shared: bool = False):
 
 
 def test_compile_vision_encoder_blocks_wraps_each_layer():
-    """Each layer must have been passed to block.compile() (indicated by
-    ``_compiled_call_impl`` being set, which torch sets on every compiled module)."""
+    """Each layer must have ``_compiled_call_impl`` set after compilation."""
     model = _model_with_vision_encoder(num_layers=3)
     layers = list(model.vision_model.encoder.layers)
 
@@ -81,8 +72,7 @@ def test_compile_vision_encoder_blocks_wraps_each_layer():
 
 
 def test_compile_vision_encoder_blocks_counts_aliased_layers_once():
-    """When PP aliases the same block object across multiple slots, compile() must
-    be called exactly once (same semantics as _compile_blocks in the runner)."""
+    """Aliased block objects must be compiled exactly once."""
     model = _model_with_vision_encoder(num_layers=4, shared=True)
     layer = model.vision_model.encoder.layers[0]
 
@@ -92,7 +82,7 @@ def test_compile_vision_encoder_blocks_counts_aliased_layers_once():
 
 
 def test_compile_vision_encoder_blocks_registers_with_compile_guard(monkeypatch):
-    """compile_guard.watch must be called once per unique block object."""
+    """``compile_guard.watch`` must be called once per unique block."""
     from spyre_inference.v1.worker import compile_guard
 
     watched: list[object] = []
@@ -108,29 +98,27 @@ def test_compile_vision_encoder_blocks_registers_with_compile_guard(monkeypatch)
 
 
 def test_compile_vision_encoder_blocks_noop_without_vision_model():
-    """A model with no vision_model attribute must not raise."""
+    """Must not raise when ``vision_model`` is absent."""
     _compile_vision_encoder_blocks(types.SimpleNamespace())
 
 
 def test_compile_vision_encoder_blocks_noop_without_encoder():
-    """vision_model present but no encoder: must not raise."""
+    """Must not raise when ``encoder`` is absent."""
     model = types.SimpleNamespace(vision_model=types.SimpleNamespace())
     _compile_vision_encoder_blocks(model)
 
 
 def test_compile_vision_encoder_blocks_noop_with_empty_layers():
-    """An empty ModuleList (e.g. all layers on other PP ranks) must not raise."""
+    """Must not raise when ``layers`` is empty."""
     encoder = types.SimpleNamespace(layers=nn.ModuleList([]))
     model = types.SimpleNamespace(vision_model=types.SimpleNamespace(encoder=encoder))
     _compile_vision_encoder_blocks(model)
 
 
 def test_apply_compiles_vision_encoder_blocks():
-    """apply() must compile the vision encoder blocks in addition to swapping the
-    boundary LayerNorms -- the two are independent and both must happen."""
+    """``apply()`` must compile the vision encoder blocks."""
     model = _model_with_vision_encoder(num_layers=2)
-    # apply() also touches text_model/vision_model norms; add stubs so it doesn't
-    # crash on the LayerNorm swap path (the vision_model here has no pre_layrnorm).
+    # Stub text_model so apply() doesn't crash on the LayerNorm swap path.
     model.text_model = types.SimpleNamespace()
 
     layers = list(model.vision_model.encoder.layers)
@@ -177,7 +165,6 @@ def test_clip_attn_mask_op_is_cached():
     q_len, seq_pad = 50, 64
     key_tensor = _full_attend_mask_key(q_len)
     try:
-        # Clear any prior cached entry so the test is independent.
         if hasattr(key_tensor, _VISION_MASK_ATTR):
             delattr(key_tensor, _VISION_MASK_ATTR)
 
@@ -191,8 +178,7 @@ def test_clip_attn_mask_op_is_cached():
 
 
 def test_clip_attn_mask_op_different_batch_sizes_do_not_collide():
-    """Different batch sizes on the same q_len must each get their own correctly
-    shaped mask and must not return a stale entry from a previous call."""
+    """Different ``b`` values on the same ``q_len`` must produce distinct tensors."""
     from spyre_inference.custom_ops.vit_attn import _clip_attn_mask_op
     from spyre_inference.multimodal.utils import _VISION_MASK_ATTR, _full_attend_mask_key
 
@@ -207,7 +193,6 @@ def test_clip_attn_mask_op_different_batch_sizes_do_not_collide():
 
         assert m1.shape == (1, 1, seq_pad, seq_pad)
         assert m2.shape == (2, 1, seq_pad, seq_pad)
-        # A cache miss on b=2 must not return the b=1 tensor.
         assert m1 is not m2
     finally:
         if hasattr(key_tensor, _VISION_MASK_ATTR):
@@ -215,17 +200,13 @@ def test_clip_attn_mask_op_different_batch_sizes_do_not_collide():
 
 
 def test_ensure_clip_attn_mask_registered():
-    """``_ensure_clip_attn_mask_registered`` must make the op callable and be
-    idempotent (safe to call multiple times)."""
+    """Op must be present after registration and callable; registration must be idempotent."""
     from spyre_inference.custom_ops.vit_attn import _ensure_clip_attn_mask_registered
 
     _ensure_clip_attn_mask_registered()
-    _ensure_clip_attn_mask_registered()  # second call must not raise
+    _ensure_clip_attn_mask_registered()
 
-    assert hasattr(torch.ops.vllm, "spyre_clip_attn_mask"), (
-        "torch.ops.vllm.spyre_clip_attn_mask not found after registration"
-    )
-    # Smoke-call the registered op.
+    assert hasattr(torch.ops.vllm, "spyre_clip_attn_mask")
     out = torch.ops.vllm.spyre_clip_attn_mask(50, 1, 64, torch.float32, torch.device("cpu"))
     assert out.shape == (1, 1, 64, 64)
 
@@ -251,11 +232,7 @@ def _make_mm_encoder_attention(num_heads: int, head_size: int):
 
 @pytest.fixture
 def _restore_mm_encoder_attention_forward():
-    """Save and restore MMEncoderAttention._forward_sdpa around each test.
-
-    Without restoration, the first test that calls patch_mm_encoder_attention
-    poisons the class-level guard for all subsequent tests in the same process.
-    """
+    """Restore ``MMEncoderAttention._forward_sdpa`` after each test."""
     original = MMEncoderAttention._forward_sdpa
     try:
         yield
@@ -265,8 +242,7 @@ def _restore_mm_encoder_attention_forward():
 
 @pytest.mark.usefixtures("_restore_mm_encoder_attention_forward")
 def test_patch_mm_encoder_attention_replaces_forward_sdpa():
-    """After patching, ``MMEncoderAttention._forward_sdpa`` must be the Spyre
-    replacement (identified by the ``_spyre_patched`` sentinel)."""
+    """``_forward_sdpa`` must carry the ``_spyre_patched`` sentinel after patching."""
     patch_mm_encoder_attention()
 
     assert getattr(MMEncoderAttention._forward_sdpa, "_spyre_patched", False)
@@ -274,8 +250,7 @@ def test_patch_mm_encoder_attention_replaces_forward_sdpa():
 
 @pytest.mark.usefixtures("_restore_mm_encoder_attention_forward")
 def test_patch_mm_encoder_attention_is_idempotent():
-    """Calling patch_mm_encoder_attention() twice must not raise and must not
-    re-assign the method (the idempotency guard must fire on the second call)."""
+    """A second call must not re-assign ``_forward_sdpa``."""
     patch_mm_encoder_attention()
     first = MMEncoderAttention._forward_sdpa
 
@@ -289,15 +264,13 @@ def test_patch_mm_encoder_attention_is_idempotent():
 @pytest.mark.parametrize(
     ("b", "s", "h", "d"),
     [
-        (2, 64, 4, 16),  # stick-aligned seq and head-dim
-        (1, 50, 8, 64),  # S=50 is the ViT-B/32 patch count (not stick-aligned)
+        (2, 64, 4, 16),  # stick-aligned
+        (1, 50, 8, 64),  # ViT-B/32 patch count, not stick-aligned
     ],
     ids=["aligned_seq", "non_aligned_seq"],
 )
 def test_patch_mm_encoder_attention_forward_produces_correct_shape(b, s, h, d):
-    """The patched ``_forward_sdpa`` must return ``[B, S, H*D]`` from a
-    ``[B, S, H*D]`` 3-D input (the ``is_reshaped`` path), across both aligned and
-    non-aligned sequence lengths."""
+    """Patched ``_forward_sdpa`` must return ``[B, S, H*D]`` from a 3-D input."""
     patch_mm_encoder_attention()
 
     hidden = h * d

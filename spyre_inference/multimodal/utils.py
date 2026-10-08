@@ -32,24 +32,19 @@ def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
 
 
-# Attribute under which a source mask caches its padded counterpart `(key, padded)`.
+# Attribute names under which masks are cached on the key tensor returned by
+# ``_full_attend_mask_key``. Each user gets its own attribute to avoid collisions.
 _MASK_ATTR = "_spyre_padded_mask"
-
-# Separate attribute used by ``_clip_attn_mask_op`` so it does not collide with
-# ``_padded_attn_mask``'s cache entry on the same key tensor.
 _VISION_MASK_ATTR = "_spyre_vision_attn_mask"
-
-# Per-sequence-length cache key objects used by callers that need a stable handle
-# on which to attach a cached mask attribute (e.g. ``_clip_attn_mask_op``).
 
 
 @lru_cache(maxsize=16)
 def _full_attend_mask_key(seq: int) -> torch.Tensor:
-    """Return a stable ``torch.ones(seq, seq)`` object for use as a cache key.
+    """Stable per-length tensor used as a cache handle by mask builders.
 
-    ``lru_cache`` guarantees the same object is returned for the same ``seq``,
-    so callers can use ``getattr``/``setattr`` on it to cache computed masks
-    without a separate dict. The tensor is on CPU and is never moved to a device.
+    The same object is always returned for the same ``seq``, so callers can
+    attach cached masks via ``getattr``/``setattr`` without a separate dict.
+    Never moved to a device.
     """
     return torch.ones(seq, seq, dtype=torch.bool)
 
@@ -62,17 +57,13 @@ def _padded_attn_mask(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`.
-
-    O(L²) and shared by every layer, so it is cached on the source mask: one upload
-    per image, released with its source.
-    """
+    """Additive ``[b, 1, seq_pad, seq_pad]`` mask on ``device``, cached on ``mask``."""
     key = (b, seq, seq_pad, dtype, str(device))
     cached = getattr(mask, _MASK_ATTR, None)
     if cached is not None and cached[0] == key:
         return cached[1]
 
-    # Assembled on CPU: strided slice-assign is not stick-safe on Spyre.
+    # Assembled on CPU: strided slice-assign is not stick-safe on-device.
     neg_inf = torch.finfo(dtype).min
     m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
     m[:, :, :, seq:] = neg_inf  # padded keys never attended
@@ -97,16 +88,14 @@ def padded_sdpa(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
-    """SDPA over `[B, H, L, D]` with L and D padded to the stick, then cropped.
+    """SDPA over ``[B, H, L, D]`` with L and D stick-aligned, then cropped.
 
-    At a sequence length coprime with the stick, stock SDPA either fails to
-    restickify a batch-matmul operand or returns silently wrong values, so the
-    padding is a correctness requirement rather than a tuning choice. Padded keys are
-    masked to `-inf` and padded queries cropped off.
+    Padding is a correctness requirement: sequence lengths not divisible by the
+    stick produce wrong results on-device. Padded keys are masked to ``-inf``;
+    padded queries are cropped after the call.
 
-    `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
-    so the padding cannot change it. Pass it explicitly when the head dim is already
-    padded, or when the model carries its own scale.
+    ``scale`` defaults to the unpadded head dim. Pass it explicitly when the
+    model carries its own scale.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -117,14 +106,13 @@ def padded_sdpa(
     padded = (seq_pad, d_pad) != (seq, d)
 
     if padded:
-        # F.pad's tuple runs from the last dim backwards: (D left, D right, L left, L right).
+        # F.pad tuple is last-dim-first: (D_left, D_right, L_left, L_right).
         pad = (0, d_pad - d, 0, seq_pad - seq)
         q = F.pad(q, pad)
         k = F.pad(k, pad)
         v = F.pad(v, pad)
     else:
-        # Offset operands read as offset 0 (torch-spyre#3770), so SDPA is silently
-        # wrong here; the padded branch escapes it only because F.pad materializes.
+        # Offset operands must be materialized (torch-spyre#3770).
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -139,7 +127,5 @@ def padded_sdpa(
     )
 
     if padded:
-        # Offset-0 prefix slice, so torch-spyre#3770 cannot bite. Left as a view: the
-        # caller's transpose+reshape materializes it anyway.
         out = out[:, :, :seq, :d]
     return out

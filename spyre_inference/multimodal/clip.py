@@ -12,21 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLIP boundary-LayerNorm workaround for Spyre.
+"""CLIP workarounds for Spyre: boundary LayerNorm replacement and vision encoder compilation.
 
-Only ``vision_model.pre_layrnorm``/``post_layernorm`` and
-``text_model.final_layer_norm`` are swapped to ``SpyreLayerNorm``. Those three
-sit at the model boundary, outside any per-block compiled graph, which is
-what triggers the crash ``SpyreLayerNorm`` works around (see
-``spyre_inference.custom_ops.layer_norm``). ``CLIPEncoderLayer.layer_norm1``/
-``layer_norm2`` are traced inside the per-block ``torch.compile`` region
-already and never hit that crashing path, so they're left as plain
-``nn.LayerNorm`` -- swapping them too would be unnecessary.
+The three boundary norms (``vision_model.pre_layrnorm``/``post_layernorm``,
+``text_model.final_layer_norm``) are swapped to ``SpyreLayerNorm`` (see
+``custom_ops/layer_norm``). The inner per-block norms are left as ``nn.LayerNorm``
+because they are traced inside a compiled region and do not need the workaround.
 
-Applied to the already-loaded model instance (weights included), so the
-replacement ``SpyreLayerNorm`` here copies the original's already-loaded
-weight/bias explicitly, rather than relying on a later ``load_weights()``
-pass to populate them.
+Weights are copied explicitly because ``apply()`` runs on the already-loaded model
+instance, after ``load_weights()`` has already run.
 """
 
 from __future__ import annotations
@@ -160,34 +154,14 @@ def patch_class_token_select() -> None:
 
 
 def patch_mm_encoder_attention() -> None:
-    """Replace ``MMEncoderAttention._forward_sdpa`` with a version that calls
-    ``F.scaled_dot_product_attention`` directly with a pre-built mask, bypassing
-    ``torch.ops.vllm.torch_sdpa_wrapper``.
+    """Replace ``MMEncoderAttention._forward_sdpa`` with a stick-aligned SDPA impl.
 
-    Two problems arise when ``CLIPEncoderLayer`` is compiled with ``torch.compile``:
-
-    1. ``torch.ops.vllm.torch_sdpa_wrapper`` is a registered custom op whose fake
-       impl has a broken schema (``cu_seqlens`` is not optional), so Dynamo's shape
-       inference raises ``TypeError`` when tracing the block.  The existing
-       ``vit_attn.register()`` patch replaces ``apply_sdpa`` *inside* the custom op,
-       but that is invisible across the custom op boundary.
-
-    2. Even with the custom op replaced, building the attention mask inside the
-       compiled block traces the CPU slice-assign into the graph.  The Spyre
-       inductor backend cannot lower a ``FixedLayout('cpu', …)`` buffer.
-
-    Fix: replace ``_forward_sdpa`` with a version that:
-    - calls ``torch.ops.vllm.spyre_clip_attn_mask`` (a custom op registered in
-      ``custom_ops/vit_attn.py``) to obtain the device attention mask opaquely —
-      its fake impl returns the correct shape so Dynamo can trace through it
-      without lowering the CPU construction, and it is fullgraph-compatible
-      (unlike ``torch.compiler.disable``, which causes an illegal graph break), then
-    - calls ``F.pad`` + ``F.scaled_dot_product_attention`` inline so the compute
-      is fully compiled on-device.
+    The replacement calls ``torch.ops.vllm.spyre_clip_attn_mask`` (a custom op
+    registered in ``custom_ops/vit_attn.py``) to obtain the additive mask opaquely,
+    then calls ``F.pad`` + ``F.scaled_dot_product_attention`` inline.
 
     ``CLIPAttention.forward`` always calls ``self.attn(q, k, v)`` with no
-    ``cu_seqlens``, so the CLIP vision encoder's ``_forward_sdpa`` never uses the
-    chunked batching path; the replacement hardcodes ``cu_seqlens=None``.
+    ``cu_seqlens``; the replacement hardcodes ``cu_seqlens=None``.
     """
     try:
         from vllm.model_executor.layers.attention.mm_encoder_attention import (
@@ -221,7 +195,6 @@ def patch_mm_encoder_attention() -> None:
         is_reshaped = query.dim() != 4
 
         query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
-        # query/key/value: [B, S, H, D] after view_qkv_to_4d
         q = query.transpose(1, 2)  # [B, H, S, D]
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
@@ -231,8 +204,6 @@ def patch_mm_encoder_attention() -> None:
         d_pad = align_up(d, STICK)
         device = q.device
 
-        # Build (or retrieve cached) additive mask via the custom op so the
-        # CPU construction is opaque to Dynamo (fullgraph-compatible).
         attn_mask = torch.ops.vllm.spyre_clip_attn_mask(q_len, bsz, seq_pad, q.dtype, device)
 
         pad_needed = (seq_pad, d_pad) != (q_len, d)
@@ -242,7 +213,7 @@ def patch_mm_encoder_attention() -> None:
             k = F.pad(k, pad)
             v = F.pad(v, pad)
         else:
-            # torch-spyre#3770: offset operands read as offset 0; materialize.
+            # Offset operands must be materialized (torch-spyre#3770).
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
@@ -252,7 +223,7 @@ def patch_mm_encoder_attention() -> None:
         if pad_needed:
             out = out[:, :, :q_len, :d]
 
-        out = out.transpose(1, 2)  # [B, S, H, D]
+        out = out.transpose(1, 2)
 
         if is_reshaped:
             out = out.reshape(bsz, q_len, -1)
@@ -260,28 +231,15 @@ def patch_mm_encoder_attention() -> None:
 
     _spyre_forward_sdpa._spyre_patched = True  # type: ignore[attr-defined]
     MMEncoderAttention._forward_sdpa = _spyre_forward_sdpa  # type: ignore[method-assign]
-    logger.info(
-        "Spyre: replaced MMEncoderAttention._forward_sdpa to use padded SDPA "
-        "with spyre_clip_attn_mask (bypasses torch.ops.vllm.torch_sdpa_wrapper "
-        "and keeps CPU mask construction off-graph via custom op)."
-    )
+    logger.info("Spyre: patched MMEncoderAttention._forward_sdpa with stick-aligned SDPA.")
 
 
 def _compile_vision_encoder_blocks(model: torch.nn.Module) -> None:
-    """Compile each CLIPEncoderLayer in the vision tower in place.
+    """Compile each ``CLIPEncoderLayer`` with ``fullgraph=True, dynamic=False``.
 
-    ``CLIPEncoderLayer.forward(hidden_states)`` is a pure function of its input
-    (LayerNorm → MMEncoderAttention → add → LayerNorm → MLP → add) with no KV-cache,
-    no mask argument, and no graph breaks -- ``fullgraph=True`` and ``dynamic=False``
-    are safe. Identical layers share one ``forward`` code object, so the backend traces
-    once and all layers reuse the same compiled artifact.
-
-    Called after the boundary LayerNorms are swapped, and before
-    ``_compile_for_spyre`` wraps the outer model, because the CLIP vision encoder's
-    block list is filtered out by ``_is_vision_tower_path`` in
-    ``_repeated_block_lists`` (vision towers run eager by default).
-
-    No-op when the vision tower is absent or its encoder has no layers.
+    Vision tower blocks are excluded from the model-runner's block compilation
+    pass, so this function handles them explicitly. Aliased blocks (pipeline
+    parallelism) are compiled once. No-op when the tower or encoder is absent.
     """
     from spyre_inference.v1.worker import compile_guard
 
@@ -303,11 +261,7 @@ def _compile_vision_encoder_blocks(model: torch.nn.Module) -> None:
         block.compile(backend="inductor", fullgraph=True, dynamic=False)
         compile_guard.watch(block, f"{type(block).__name__} (CLIP vision block)")
 
-    logger.info(
-        "Spyre: compiled %d CLIPEncoderLayer block(s) for the vision tower "
-        "(per-block, fullgraph=True, dynamic=False).",
-        len(seen),
-    )
+    logger.info("Spyre: compiled %d CLIPEncoderLayer block(s) for the vision tower.", len(seen))
 
 
 def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.nn.LayerNorm:
