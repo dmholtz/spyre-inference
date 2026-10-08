@@ -34,10 +34,13 @@ pre-placed ``_w_2d_dev`` / ``_bias_3d_dev`` tensors, reducing three host round
 trips to one.
 """
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer
+from vllm.platforms import current_platform
 
 from .lazy_compile import CompileOutermost, maybe_compile
 from .utils import convert
@@ -112,6 +115,7 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         # process_weights_after_loading for shapes outside _layouts_supported).
         self._w_2d_dev: torch.Tensor | None = None
         self._bias_3d_dev: torch.Tensor | None = None
+        self._compiled_conv_via_matmul: Callable | None = None
 
     @maybe_compile
     def _conv_native(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
@@ -125,7 +129,6 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             groups=self.groups,
         )
 
-    @maybe_compile
     def _conv_via_matmul(
         self,
         patches: torch.Tensor,
@@ -222,6 +225,17 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
                     padding=self.padding,
                     stride=self.stride,
                 )
+                if not torch.compiler.is_compiling() and self.spyre_compile_enabled:
+                    if self._compiled_conv_via_matmul is None:
+                        self._compiled_conv_via_matmul = torch.compile(
+                            self._conv_via_matmul,
+                            backend=current_platform.simple_compile_backend,
+                            fullgraph=True,
+                            dynamic=False,
+                        )
+                    return self._compiled_conv_via_matmul(
+                        patches, self._w_2d_dev, self._bias_3d_dev, H_out, W_out
+                    )
                 return self._conv_via_matmul(
                     patches, self._w_2d_dev, self._bias_3d_dev, H_out, W_out
                 )
