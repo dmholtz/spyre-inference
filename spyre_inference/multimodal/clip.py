@@ -25,6 +25,11 @@ those are swapped to ``SpyreLayerNorm``.
 The text tower's in-block norms stay stock. Its blocks contain decoder
 attention, so per-block compile traces them and they never take that path.
 
+Under ``--enforce-eager`` the vision block's residual add still fails: the
+saved residual and the attention output do not share a layout, and Spyre
+rejects that add. Those two operands are rebuilt in the default layout first.
+The compiled path is left alone; it already adds them successfully.
+
 Applied to the already-loaded model instance (weights included), so the
 replacement ``SpyreLayerNorm`` here copies the original's already-loaded
 weight/bias explicitly, rather than relying on a later ``load_weights()``
@@ -206,6 +211,51 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     )
 
 
+def _uncompiled() -> bool:
+    """True when this process is not tracing per-block graphs.
+
+    ``apply()`` also runs from unit tests with no vLLM config context; treat that
+    as compiled so the eager-only forward patch stays off.
+    """
+    try:
+        from vllm.config import CompilationMode, get_cached_compilation_config
+
+        return get_cached_compilation_config().mode is CompilationMode.NONE
+    except Exception:
+        return False
+
+
+def _default_layout(x: torch.Tensor) -> torch.Tensor:
+    """Rebuild ``x`` in the default layout. A no-op off Spyre."""
+    if x.device.type != "spyre":
+        return x
+    from spyre_inference.custom_ops.utils import convert
+
+    return convert(convert(x, "cpu").contiguous(), x.device)
+
+
+def _patch_eager_residual(layer: torch.nn.Module) -> None:
+    """Add the residual only after both operands share the default layout."""
+    if getattr(layer.forward, "_spyre_residual_patched", False):
+        return
+    if not hasattr(layer, "self_attn") or not hasattr(layer, "mlp"):
+        return
+
+    def forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = layer.layer_norm1(hidden_states)
+        hidden_states, _ = layer.self_attn(hidden_states=hidden_states)
+        hidden_states = _default_layout(residual) + _default_layout(hidden_states)
+
+        residual = hidden_states
+        hidden_states = layer.layer_norm2(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        return _default_layout(residual) + _default_layout(hidden_states)
+
+    forward._spyre_residual_patched = True  # type: ignore[attr-defined]
+    layer.forward = forward  # type: ignore[method-assign]
+
+
 def _swap_vision_block_norms(vision_model: torch.nn.Module, device: torch.device) -> None:
     """The vision tower is never per-block compiled, so its block norms take the
     eager decomposition. ``type is`` rather than ``isinstance``: ``SpyreLayerNorm``
@@ -219,3 +269,9 @@ def _swap_vision_block_norms(vision_model: torch.nn.Module, device: torch.device
             ln = getattr(layer, name, None)
             if type(ln) is torch.nn.LayerNorm:
                 setattr(layer, name, _to_spyre_layer_norm(ln, device))
+        if _uncompiled():
+            _patch_eager_residual(layer)
+            logger.info_once(
+                "Spyre: eager CLIP vision residual adds rebuild both operands "
+                "in the default layout."
+            )

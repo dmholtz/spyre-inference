@@ -140,6 +140,54 @@ def test_apply_preserves_shape_eps_affine_bias(elementwise_affine, bias):
     assert patched.elementwise_affine == elementwise_affine
 
 
+def test_eager_vision_residual_add_uses_the_patched_forward(monkeypatch):
+    """Eager mode replaces the block forward. Off Spyre the layout rebuild is a
+    no-op, so the arithmetic is the stock residual block."""
+    monkeypatch.setattr("spyre_inference.multimodal.clip._uncompiled", lambda: True)
+
+    class _Attn(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states + 1, None
+
+    class _Mlp(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states + 2
+
+    layer = torch.nn.Module()
+    layer.layer_norm1 = torch.nn.Identity()
+    layer.layer_norm2 = torch.nn.Identity()
+    layer.self_attn = _Attn()
+    layer.mlp = _Mlp()
+    vision = types.SimpleNamespace(encoder=types.SimpleNamespace(layers=[layer]))
+
+    apply_clip_patches(vision, torch.device("cpu"))
+
+    out = layer(torch.zeros(1, 2, 4))
+    # identity norms; attention adds 1, then the MLP adds 2 onto that sum:
+    # (0 + 1) + ((0 + 1) + 2) = 4
+    assert torch.equal(out, torch.full((1, 2, 4), 4.0))
+    assert layer.forward._spyre_residual_patched is True
+
+
+def test_compiled_vision_blocks_keep_their_forward(monkeypatch):
+    monkeypatch.setattr("spyre_inference.multimodal.clip._uncompiled", lambda: False)
+
+    def _original(hidden_states):
+        return hidden_states
+
+    layer = torch.nn.Module()
+    layer.layer_norm1 = torch.nn.Identity()
+    layer.layer_norm2 = torch.nn.Identity()
+    layer.self_attn = torch.nn.Identity()
+    layer.mlp = torch.nn.Identity()
+    layer.forward = _original  # type: ignore[method-assign]
+    vision = types.SimpleNamespace(encoder=types.SimpleNamespace(layers=[layer]))
+
+    apply_clip_patches(vision, torch.device("cpu"))
+
+    assert layer.forward is _original
+
+
 def test_apply_multimodal_patches_dispatches_to_clip():
     """`model.config.model_type == "clip"` is the gate `apply_multimodal_patches` uses
     to route to clip.apply() -- a rename would silently stop dispatching, so pin the
