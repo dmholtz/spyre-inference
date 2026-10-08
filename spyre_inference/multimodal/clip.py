@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLIP boundary-LayerNorm workaround for Spyre.
+"""CLIP LayerNorm workaround for Spyre.
 
-Only ``vision_model.pre_layrnorm``/``post_layernorm`` and
-``text_model.final_layer_norm`` are swapped to ``SpyreLayerNorm``. Those three
-sit at the model boundary, outside any per-block compiled graph, which is
-what triggers the crash ``SpyreLayerNorm`` works around (see
-``spyre_inference.custom_ops.layer_norm``). ``CLIPEncoderLayer.layer_norm1``/
-``layer_norm2`` are traced inside the per-block ``torch.compile`` region
-already and never hit that crashing path, so they're left as plain
-``nn.LayerNorm`` -- swapping them too would be unnecessary.
+``vision_model.pre_layrnorm``/``post_layernorm`` and
+``text_model.final_layer_norm`` sit outside any compiled graph.
+``vision_model``'s ``layer_norm1``/``layer_norm2`` do too: the vision tower is
+excluded from per-block compile, and under ``--enforce-eager`` nothing is
+compiled, so stock ``nn.LayerNorm`` takes torch-spyre's isolated decomposition
+and crashes on the 768-wide activation (mixed element arrangement). All of
+those are swapped to ``SpyreLayerNorm``.
+
+The text tower's in-block norms stay stock. Its blocks contain decoder
+attention, so per-block compile traces them and they never take that path.
 
 Applied to the already-loaded model instance (weights included), so the
 replacement ``SpyreLayerNorm`` here copies the original's already-loaded
@@ -173,7 +175,7 @@ def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.
 
 
 def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place.
+    """Swap CLIP's uncompiled LayerNorms for ``SpyreLayerNorm``, in place.
 
     The ``isinstance`` checks are a second line of defense on top of the
     ``model_type == "clip"`` dispatch gate in ``multimodal/__init__.py``: they
@@ -196,9 +198,24 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
         post_ln = getattr(vision_model, "post_layernorm", None)
         if isinstance(post_ln, torch.nn.LayerNorm):
             vision_model.post_layernorm = _to_spyre_layer_norm(post_ln, device)
+        _swap_vision_block_norms(vision_model, device)
 
     logger.info_once(
-        "Spyre: CLIP's boundary LayerNorms (pre_layrnorm/post_layernorm/"
-        "final_layer_norm) use SpyreLayerNorm; layer_norm1/layer_norm2 inside "
-        "encoder blocks are unaffected."
+        "Spyre: CLIP vision LayerNorms and the text final norm use SpyreLayerNorm. "
+        "Text-tower in-block norms stay stock; per-block compile covers them."
     )
+
+
+def _swap_vision_block_norms(vision_model: torch.nn.Module, device: torch.device) -> None:
+    """The vision tower is never per-block compiled, so its block norms take the
+    eager decomposition. ``type is`` rather than ``isinstance``: ``SpyreLayerNorm``
+    subclasses ``nn.LayerNorm``."""
+    encoder = getattr(vision_model, "encoder", None)
+    layers = getattr(encoder, "layers", None)
+    if layers is None:
+        return
+    for layer in layers:
+        for name in ("layer_norm1", "layer_norm2"):
+            ln = getattr(layer, name, None)
+            if type(ln) is torch.nn.LayerNorm:
+                setattr(layer, name, _to_spyre_layer_norm(ln, device))

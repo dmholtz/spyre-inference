@@ -41,10 +41,18 @@ def _fake_clip_model(hidden_size: int = 64, with_post_norm: bool = True):
     text_model.final_layer_norm.weight.data.normal_(generator=g)
     text_model.final_layer_norm.bias.data.normal_(generator=g)
 
+    def _block():
+        return types.SimpleNamespace(
+            layer_norm1=torch.nn.LayerNorm(hidden_size),
+            layer_norm2=torch.nn.LayerNorm(hidden_size),
+        )
+
     vision_model = types.SimpleNamespace(
         pre_layrnorm=torch.nn.LayerNorm(hidden_size),
         post_layernorm=(torch.nn.LayerNorm(hidden_size) if with_post_norm else None),
+        encoder=types.SimpleNamespace(layers=[_block(), _block()]),
     )
+    text_model.encoder = types.SimpleNamespace(layers=[_block()])
     vision_model.pre_layrnorm.weight.data.normal_(generator=g)
     vision_model.pre_layrnorm.bias.data.normal_(generator=g)
     if with_post_norm:
@@ -66,9 +74,13 @@ def test_apply_swaps_boundary_norms_and_preserves_weights():
     assert isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
     assert isinstance(model.vision_model.pre_layrnorm, SpyreLayerNorm)
     assert isinstance(model.vision_model.post_layernorm, SpyreLayerNorm)
-    # Not swapped: layer_norm1/layer_norm2 (inside encoder blocks) aren't touched,
-    # and this stand-in doesn't even define them -- swapping only the three
-    # boundary norms is the whole point.
+    for layer in model.vision_model.encoder.layers:
+        assert isinstance(layer.layer_norm1, SpyreLayerNorm)
+        assert isinstance(layer.layer_norm2, SpyreLayerNorm)
+    # Text blocks are per-block compiled, so their norms stay stock.
+    for layer in model.text_model.encoder.layers:
+        assert type(layer.layer_norm1) is torch.nn.LayerNorm
+        assert type(layer.layer_norm2) is torch.nn.LayerNorm
     torch.testing.assert_close(model.text_model.final_layer_norm.weight, orig_text_w)
     torch.testing.assert_close(model.text_model.final_layer_norm.bias, orig_text_b)
     torch.testing.assert_close(model.vision_model.pre_layrnorm.weight, orig_pre_w)

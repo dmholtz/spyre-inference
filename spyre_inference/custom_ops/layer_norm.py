@@ -36,12 +36,11 @@ itself does internally, and needed here because CLIP's boundary norms are
 exactly where activation outliers of that magnitude show up.
 
 This is a drop-in subclass, not a global monkeypatch of
-``torch.nn.LayerNorm`` -- only the specific boundary LayerNorms that actually
-hit the crash (currently: CLIP's, patched in ``spyre_inference.multimodal.clip``)
-should be swapped to it. Most ``LayerNorm`` call sites live inside a per-block
-``torch.compile`` region and never take the crashing eager path in the first
-place, so patching them too would be unnecessary blast radius onto unrelated
-models.
+``torch.nn.LayerNorm`` -- only norms that actually run outside a compiled block
+are swapped (CLIP's boundary norms and its vision-tower block norms; see
+``spyre_inference.multimodal.clip``). Most other call sites live inside a
+per-block ``torch.compile`` region and never take the crashing eager path, so
+patching them would be blast radius onto unrelated models.
 """
 
 from __future__ import annotations
