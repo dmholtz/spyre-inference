@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The rectangular path's grid layout is a contract between two places in the runner:
-``_preprocess`` scatters the packed tokens into ``[B*L]``, and ``_unpad_encoder_hidden``
-gathers them back for the pooler. They share one row-index table, so a round trip is
-the thing worth testing.
+"""Test the rectangular grid layout and its pooling row selections.
+
+``_preprocess`` expands packed tokens into ``[B*L]``; packed-order pooling
+re-compacts the grid, while CLS selects its first rows directly and MEAN reduces
+each lane in place.
 """
 
 import numpy as np
@@ -28,7 +29,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from spyre_inference.models.bert import SpyreBertEmbedding
 from spyre_inference.models.roberta import SpyreRobertaEmbedding
-from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool
+from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool, SpyreMeanPool
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
@@ -283,11 +284,21 @@ def test_rectangular_cls_matches_unpad_then_gather():
     pooler = SequencePooler(pooling=SpyreCLSPool(), head=nn.Identity())
     runner = _runner(pooler, (extent, width, query_lens))
 
-    assert runner._rectangular_cls(metadata)
-    assert not _runner(
-        SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()),
-        (extent, width, query_lens),
-    )._rectangular_cls(metadata)
+    assert isinstance(runner._rectangular_pooling(metadata), SpyreCLSPool)
+    assert isinstance(
+        _runner(
+            SequencePooler(pooling=SpyreMeanPool(), head=nn.Identity()),
+            (extent, width, query_lens),
+        )._rectangular_pooling(metadata),
+        SpyreMeanPool,
+    )
+    assert (
+        _runner(
+            SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()),
+            (extent, width, query_lens),
+        )._rectangular_pooling(metadata)
+        is None
+    )
 
     packed = runner._unpad_encoder_hidden(hidden, sum(query_lens))
     cls = SpyreCLSPool()

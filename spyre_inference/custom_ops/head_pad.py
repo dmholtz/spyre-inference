@@ -14,14 +14,14 @@
 
 """Native-path attention head padding to a stick-aligned head_dim.
 
-A head_dim whose half is not a multiple of the 64-element fp16 stick (e.g.
-head_size=64) cannot restickify after RoPE, so the KV write-back fails to lower
-on Spyre. ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to a
-128-multiple before the model is built (sizing QKV/o_proj/Attention/KV-cache/RoPE
-at the padded width); the passes here fill the padded region on load (including the
-QK-norm weights of models that normalize over head_dim) and restore the two things
-the width override would otherwise corrupt — the RoPE frequencies and the attention
-scale.
+A head_dim that is not a multiple of the 64-element fp16 stick cannot lower on Spyre,
+and on the Transformers backend neither can one whose half isn't (its RoPE views a head
+as two halves). ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to the
+next 64-multiple (128-multiple for RoPE on the Transformers backend) before the model is
+built (sizing QKV/o_proj/Attention/KV-cache/RoPE at the padded width); the passes here
+fill the padded region on load (including the QK-norm weights of models that normalize
+over head_dim), restore the RoPE frequencies and attention scale, and compensate QK-norm
+epsilon for the wider reduction.
 
 Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
 rotation cache keeps the original frequencies. The Transformers backend shares the
@@ -186,8 +186,8 @@ def install_padded_head_dim(model_config) -> None:
 
     Overriding ``config.head_dim`` only widens a model that reads it. vLLM's
     ``Qwen2Attention`` computes ``self.head_dim = hidden_size // total_num_heads``
-    and never consults the config, so the override left it 64-wide while the weight
-    pass emitted 128-wide tensors — which ``QKVParallelLinear.weight_loader``
+    and never consults the config, so the override left it at the native width while
+    the weight pass emitted padded tensors — which ``QKVParallelLinear.weight_loader``
     narrows back to the param width without complaint, loading truncated weights
     and no error.
 
@@ -307,11 +307,12 @@ def verify_padded_head_dim(model, hf_config, model_config=None) -> None:
 
 def install_head_pad_weight_loader(model_loader, hf_config, model_config=None) -> None:
     """Wrap ``model_loader.get_all_weights`` to pad q/k/v/o head_dim to the width
-    the platform chose (64->128 for RoPE decoders, 32->64 for pooling models).
+    the platform chose (the next 64-multiple, e.g. 16->64 or 96->128; the next
+    128-multiple for RoPE decoders on the Transformers backend).
 
     The transform runs on the raw ``(name, tensor)`` stream before vLLM's
     ``WeightsMapper`` and ``weight_loader`` (which ``.narrow`` and assert exact
-    shapes against the now-128-wide params). Full unsharded tensors are padded
+    shapes against the now-padded params). Full unsharded tensors are padded
     per-head, so TP narrowing downstream still selects whole padded heads.
     Only text-backbone weights are padded (see ``text_backbone``).
     """
@@ -479,7 +480,7 @@ def fix_padded_rope(model, hf_config, model_config=None) -> None:
         rope._rotation_cache = None
         rope._device_rotation_cache = None
         # Narrowed frequencies make this instance model-specific; unshare it so
-        # get_rope cannot hand it to a later model with a real head_dim of orig*2.
+        # get_rope cannot hand it to a later model whose real head_dim is the padded width.
         for cache_key, cached in list(_ROPE_DICT.items()):
             if cached is rope:
                 del _ROPE_DICT[cache_key]
