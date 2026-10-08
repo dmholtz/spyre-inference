@@ -159,7 +159,21 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@_EAGER_AND_COMPILED
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(
+            True,
+            id="eager",
+            marks=pytest.mark.xfail(
+                reason="eager CLIP vision layer_norm1 crashes in torch-spyre "
+                "(mixed element arrangement, hidden size 768); compiled passes",
+                strict=True,
+            ),
+        ),
+        pytest.param(False, id="compiled", marks=pytest.mark.model_quality),
+    ],
+)
 def test_clip_image_embedding_matches_hf(enforce_eager: bool) -> None:
     _skip_without_spyre()
     image = _synthetic_image()
