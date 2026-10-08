@@ -28,9 +28,9 @@ attention, so per-block compile traces them and they never take that path.
 Under ``--enforce-eager`` the vision block's residual add still fails: the
 saved residual and the attention output do not share a layout, and Spyre
 rejects that add. Those two operands are rebuilt in the default layout first.
-That host round trip leaves the activation in a layout the pooler's
-``index_select`` cannot gather, so eager CLS/LAST gathers place it
-row-outermost first. The compiled path is left alone.
+That host round trip leaves an activation whose on-device ``index_select``
+compiles an identity the scheduler cannot map, so eager CLS/LAST gathers
+copy the rows to the host first. The compiled path is left alone.
 
 Applied to the already-loaded model instance (weights included), so the
 replacement ``SpyreLayerNorm`` here copies the original's already-loaded
@@ -208,8 +208,11 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
             vision_model.post_layernorm = _to_spyre_layer_norm(post_ln, device)
         _swap_vision_block_norms(vision_model, device, eager)
 
-    if eager and callable(getattr(model, "forward", None)):
-        _patch_eager_image_gather(model)
+    if eager:
+        from spyre_inference.v1.pool.spyre_pooler import arm_eager_host_pool
+
+        arm_eager_host_pool()
+        logger.info_once("Spyre: eager CLIP CLS/LAST pooling gathers on the host.")
 
     logger.info_once(
         "Spyre: CLIP vision LayerNorms and the text final norm use SpyreLayerNorm. "
@@ -238,27 +241,6 @@ def _default_layout(x: torch.Tensor) -> torch.Tensor:
     from spyre_inference.custom_ops.utils import convert
 
     return convert(convert(x, "cpu").contiguous(), x.device)
-
-
-def _patch_eager_image_gather(model: torch.nn.Module) -> None:
-    """Mark an image-only forward so the pooler can relayout its activation."""
-    if getattr(model.forward, "_spyre_image_gather", False):
-        return
-    original = model.forward
-
-    def forward(*args, **kwargs):
-        out = original(*args, **kwargs)
-        if not getattr(model, "_has_text_tokens", True):
-            from spyre_inference.v1.pool.spyre_pooler import note_image_gather
-
-            note_image_gather()
-            logger.info_once(
-                "Spyre: eager CLIP image pooling gathers place hidden states row-outermost."
-            )
-        return out
-
-    forward._spyre_image_gather = True  # type: ignore[attr-defined]
-    model.forward = forward  # type: ignore[method-assign]
 
 
 def _patch_eager_residual(layer: torch.nn.Module) -> None:
