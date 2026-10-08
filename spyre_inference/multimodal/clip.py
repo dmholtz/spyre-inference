@@ -28,7 +28,9 @@ attention, so per-block compile traces them and they never take that path.
 Under ``--enforce-eager`` the vision block's residual add still fails: the
 saved residual and the attention output do not share a layout, and Spyre
 rejects that add. Those two operands are rebuilt in the default layout first.
-The compiled path is left alone; it already adds them successfully.
+That host round trip leaves the activation in a layout the pooler's
+``index_select`` cannot gather, so eager CLS/LAST gathers place it
+row-outermost first. The compiled path is left alone.
 
 Applied to the already-loaded model instance (weights included), so the
 replacement ``SpyreLayerNorm`` here copies the original's already-loaded
@@ -195,6 +197,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
         if isinstance(ln, torch.nn.LayerNorm):
             text_model.final_layer_norm = _to_spyre_layer_norm(ln, device)
 
+    eager = _uncompiled()
     vision_model = getattr(model, "vision_model", None)
     if vision_model is not None:
         pre_ln = getattr(vision_model, "pre_layrnorm", None)
@@ -203,7 +206,10 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
         post_ln = getattr(vision_model, "post_layernorm", None)
         if isinstance(post_ln, torch.nn.LayerNorm):
             vision_model.post_layernorm = _to_spyre_layer_norm(post_ln, device)
-        _swap_vision_block_norms(vision_model, device)
+        _swap_vision_block_norms(vision_model, device, eager)
+
+    if eager and callable(getattr(model, "forward", None)):
+        _patch_eager_image_gather(model)
 
     logger.info_once(
         "Spyre: CLIP vision LayerNorms and the text final norm use SpyreLayerNorm. "
@@ -234,6 +240,27 @@ def _default_layout(x: torch.Tensor) -> torch.Tensor:
     return convert(convert(x, "cpu").contiguous(), x.device)
 
 
+def _patch_eager_image_gather(model: torch.nn.Module) -> None:
+    """Mark an image-only forward so the pooler can relayout its activation."""
+    if getattr(model.forward, "_spyre_image_gather", False):
+        return
+    original = model.forward
+
+    def forward(*args, **kwargs):
+        out = original(*args, **kwargs)
+        if not getattr(model, "_has_text_tokens", True):
+            from spyre_inference.v1.pool.spyre_pooler import note_image_gather
+
+            note_image_gather()
+            logger.info_once(
+                "Spyre: eager CLIP image pooling gathers place hidden states row-outermost."
+            )
+        return out
+
+    forward._spyre_image_gather = True  # type: ignore[attr-defined]
+    model.forward = forward  # type: ignore[method-assign]
+
+
 def _patch_eager_residual(layer: torch.nn.Module) -> None:
     """Add the residual only after both operands share the default layout."""
     if getattr(layer.forward, "_spyre_residual_patched", False):
@@ -256,7 +283,9 @@ def _patch_eager_residual(layer: torch.nn.Module) -> None:
     layer.forward = forward  # type: ignore[method-assign]
 
 
-def _swap_vision_block_norms(vision_model: torch.nn.Module, device: torch.device) -> None:
+def _swap_vision_block_norms(
+    vision_model: torch.nn.Module, device: torch.device, eager: bool
+) -> None:
     """The vision tower is never per-block compiled, so its block norms take the
     eager decomposition. ``type is`` rather than ``isinstance``: ``SpyreLayerNorm``
     subclasses ``nn.LayerNorm``."""
@@ -269,7 +298,7 @@ def _swap_vision_block_norms(vision_model: torch.nn.Module, device: torch.device
             ln = getattr(layer, name, None)
             if type(ln) is torch.nn.LayerNorm:
                 setattr(layer, name, _to_spyre_layer_norm(ln, device))
-        if _uncompiled():
+        if eager:
             _patch_eager_residual(layer)
             logger.info_once(
                 "Spyre: eager CLIP vision residual adds rebuild both operands "

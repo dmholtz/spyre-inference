@@ -140,6 +140,37 @@ def test_apply_preserves_shape_eps_affine_bias(elementwise_affine, bias):
     assert patched.elementwise_affine == elementwise_affine
 
 
+def test_eager_image_forward_notes_the_pooling_gather(monkeypatch):
+    """An image-only eager forward asks the pooler to relayout. A text forward
+    does not, and off Spyre the relayout returns the tensor unchanged."""
+    monkeypatch.setattr("spyre_inference.multimodal.clip._uncompiled", lambda: True)
+    from spyre_inference.v1.pool import spyre_pooler as pooler
+
+    monkeypatch.setattr(pooler, "_image_gather", False)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._has_text_tokens = True
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    model = _Model()
+    apply_clip_patches(model, torch.device("cpu"))
+    tensor = torch.zeros(2, 4)
+
+    model._has_text_tokens = True
+    model(tensor)
+    assert pooler._image_gather is False
+
+    model._has_text_tokens = False
+    model(tensor)
+    assert pooler._image_gather is True
+    assert pooler.prepare_eager_gather_source(tensor) is tensor
+    assert pooler._image_gather is False
+
+
 def test_eager_vision_residual_add_uses_the_patched_forward(monkeypatch):
     """Eager mode replaces the block forward. Off Spyre the layout rebuild is a
     no-op, so the arithmetic is the stock residual block."""

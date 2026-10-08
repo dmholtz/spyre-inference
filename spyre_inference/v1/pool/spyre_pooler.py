@@ -41,10 +41,36 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.linear import spyre_linear_t
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
+
+# Set for one eager CLIP image forward. The vision tower's host round trip leaves
+# hidden states in a layout whose index_select fuses an identity the scheduler
+# cannot map (sdsc 0_identity). Text and compiled runs leave this off.
+_image_gather = False
+
+
+def note_image_gather() -> None:
+    """The next CLS/LAST gather is an eager CLIP image activation."""
+    global _image_gather
+    _image_gather = True
+
+
+def prepare_eager_gather_source(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Place a noted image activation row-outermost. Other tensors pass through."""
+    global _image_gather
+    if not _image_gather:
+        return hidden_states
+    _image_gather = False
+    if hidden_states.device.type != "spyre":
+        return hidden_states
+    layout = row_outermost_layout(hidden_states.shape, hidden_states.dtype)
+    if layout is None:
+        return hidden_states
+    host = convert(hidden_states, "cpu").contiguous()
+    return convert(host, hidden_states.device, device_layout=layout)
 
 
 def _cpu_cast_if_needed(pooled_data, head_dtype):
@@ -171,7 +197,7 @@ class SpyreCLSPool(CLSPool):
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
         idx, n_rows = pad_row_count_to_bucket(cursor.first_token_indices_gpu)
-        pooled = select_rows(hidden_states, idx)
+        pooled = select_rows(prepare_eager_gather_source(hidden_states), idx)
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
@@ -181,7 +207,7 @@ class SpyreLastPool(LastPool):
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
-        pooled = select_rows(hidden_states, idx)
+        pooled = select_rows(prepare_eager_gather_source(hidden_states), idx)
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
