@@ -33,6 +33,21 @@ def align_up(n: int, align: int = STICK) -> int:
 # Attribute under which a source mask caches its padded counterpart `(key, padded)`.
 _MASK_ATTR = "_spyre_padded_mask"
 
+# Per-sequence-length cache key objects used by callers that need a stable handle
+# on which to pin a ``_MASK_ATTR`` cache entry (e.g. ``_build_clip_attn_mask``).
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=16)
+def _full_attend_mask_key(seq: int) -> torch.Tensor:
+    """Return a stable ``torch.ones(seq, seq)`` object for use as a cache key.
+
+    ``lru_cache`` guarantees the same object is returned for the same ``seq``,
+    so callers can use ``getattr``/``setattr`` on it to cache computed masks
+    without a separate dict. The tensor is on CPU and is never moved to a device.
+    """
+    return torch.ones(seq, seq, dtype=torch.bool)
+
 
 def _padded_attn_mask(
     mask: torch.Tensor,
