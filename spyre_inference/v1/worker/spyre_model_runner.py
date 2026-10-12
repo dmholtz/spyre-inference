@@ -88,6 +88,7 @@ from spyre_inference.models import check_spyre_model
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
+from spyre_inference.multimodal.utils import blocks_marked_compilable
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -324,17 +325,23 @@ def _is_vision_tower_path(qualname: str) -> bool:
     return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
 
 
-def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
-    block_lists = []
+def _repeated_block_lists(model: nn.Module) -> list[tuple[nn.ModuleList, bool]]:
+    """Each compilable block list with whether a multimodal patch marked it."""
+    block_lists: list[tuple[nn.ModuleList, bool]] = []
     for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
             continue
-        # Encoder-only towers stay eager even if a block's class name looks like
-        # attention (Qwen2_5_VLVisionAttention). Decoder lists are never named these.
-        if _is_vision_tower_path(qualname):
-            continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
+            continue
+        # A multimodal patch marks the blocks whose body it made traceable; reading the
+        # mark off the blocks keeps an outer list that merely nests a marked tower out.
+        if blocks_marked_compilable(blocks):
+            block_lists.append((module, True))
+            continue
+        # Every other tower stays eager: its block body builds constants on the host,
+        # which have no device layout. Decoder lists are never named these.
+        if _is_vision_tower_path(qualname):
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
@@ -343,7 +350,7 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
         if any(_is_decoder_attention_like(m) for b in blocks for m in b.modules()):
-            block_lists.append(module)
+            block_lists.append((module, False))
     return block_lists
 
 
@@ -465,12 +472,12 @@ class _SpyreModelWrapper:
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        # Vision towers run eager, so each Spyre op with a decomposition reaches it
-        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
-        # without fullgraph. Decompositions built on for_each_tile (SDPA since
-        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
-        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
-        # trace dies with DataDependentOutputException.
+        # The parts of a vision tower outside a compiled block run eager, so each Spyre
+        # op with a decomposition there reaches it through torch-spyre's lazily-compiled
+        # PrivateUse1 kernel, which compiles without fullgraph. Decompositions built on
+        # for_each_tile (SDPA since torch-spyre#4550) emit a scan whose while_loop
+        # lowering reads the loop index with .item(); without fullgraph that needs
+        # capture_scalar_outputs, or the trace dies with DataDependentOutputException.
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
             return self._model.embed_multimodal(**kwargs)
 
@@ -812,6 +819,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Per-block is the default: identical blocks share a ``forward`` code object,
         # so the backend compiles one block rather than a program that grows with depth.
         granularity = _compile_granularity()
+        self._compiled_tower_blocks = 0
 
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
@@ -833,11 +841,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     defeated_by,
                 )
             num_blocks = self._compile_blocks(fullgraph=fullgraph)
+            tower = self._compiled_tower_blocks
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
+                    "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre "
                     "(fullgraph=%s).",
                     num_blocks,
+                    f" and {tower} tower blocks" if tower else "",
                     model_name,
                     fullgraph,
                 )
@@ -859,11 +869,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
     def _compile_blocks(self, fullgraph: bool = True) -> int:
-        num_blocks = 0
+        # Only decoder blocks are returned: the count decides the whole-model fallback,
+        # which an opted-in tower must not pre-empt (it compiles beside either form).
+        num_blocks = num_tower = 0
         # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
         # alias blocks across lists; recompiling one is harmless but would double the count.
         seen: set[int] = set()
-        for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
+        for blocks, marked in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
                 if isinstance(block, PPMissingLayer) or id(block) in seen:
                     continue
@@ -875,9 +887,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 # Identical blocks share one `forward` code object -- that is why this
                 # granularity shares a single artifact -- so this collapses to one
                 # registration per block *class*, which is the right granularity for
-                # the message too.
+                # the message too. A marked tower is watched like the decoder:
+                # `_warmup_multimodal_encoder` compiles it at every image-batch width.
                 compile_guard.watch(block, f"{type(block).__name__} (transformer block)")
-                num_blocks += 1
+                if marked:
+                    num_tower += 1
+                else:
+                    num_blocks += 1
+        self._compiled_tower_blocks = num_tower
         return num_blocks
 
     def warming_up_model(self) -> None:
@@ -897,9 +914,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Eager pooling: one short dummy, then ``mark_warmed_up()``. It does not run the
         vision tower: those blocks crash while the tower is still eager, and a
         text-only load would die at startup.
-        Compiled pooling with a vision tower also runs ``embed_multimodal`` at every
-        image-batch width up to ``mm_max_items_per_batch``; profile_run only traces
-        the widest one, and the tower stays eager.
+        A compiled pooling model's vision tower, and any model's compiled one, also runs
+        ``embed_multimodal`` at every image-batch width up to ``mm_max_items_per_batch``;
+        see ``_warmup_multimodal_encoder``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -932,8 +949,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # the dummy-batch seq_lens bug. No-op for encoder-only pooling
                     # models (BERT/RoBERTa), which never get a KV cache.
                     self._record_attention_graphs()
-                # CLIP's vision tower is eager and profile_run only traces the widest
-                # image batch, so every narrower width would compile on the first request.
                 self._warmup_multimodal_encoder()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
@@ -948,9 +963,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
                 self._warmup_input_embedding(num_tokens)
-                # No vision warmup here. enforce_eager reaches this branch, and the
-                # eager vision blocks crash. A text load would otherwise die in
-                # embed_multimodal before the first prompt.
+                # Only a compiled tower is warmed here. enforce_eager reaches this
+                # branch, and the eager vision blocks crash. A text load would
+                # otherwise die in embed_multimodal before the first prompt.
+                if self._compiled_tower_blocks:
+                    self._warmup_multimodal_encoder()
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -980,6 +997,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+            self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -1011,19 +1029,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warmup_multimodal_encoder(self) -> None:
-        """Compile an eager vision tower at every image-batch width it can see.
+        """Compile the vision tower at every image-batch width it can see.
 
-        Pooling warmup traces the text body only. ``profile_run`` calls
-        ``embed_multimodal`` once, at ``mm_max_items_per_batch``, so the first
-        real request at each narrower width pays a full compile. CLIP's
-        ``vision_model`` stays out of block compile, and ``SpyreConv2d`` is a
-        separate graph per batch, so each width has to run here
+        Nothing else traces the tower before the compile guard arms: the dummy runs
+        reach the text body only, and upstream's ``profile_run`` (one pass at
+        ``mm_max_items_per_batch``) never runs, as ``TorchSpyreWorker`` overrides
+        ``determine_available_memory``. Under ``dynamic=False`` every width is its own
+        graph, for marked encoder blocks and ``SpyreConv2d`` alike, so each runs here
         (spyre-inference#1182).
 
-        Generative VLMs are left alone: enumerating their tower would dominate
-        startup, and this is the pooling-encoder gap the tail latency comes from.
+        A generative VLM is enumerated only when its tower's blocks are compiled. An
+        eager tower's ops compile through torch-spyre's per-op kernels, which the guard
+        expects on the serving path, and enumerating them would dominate startup.
         """
-        if self.model_config.runner_type != "pooling" or not self.supports_mm_inputs:
+        if not self.supports_mm_inputs or (
+            self.model_config.runner_type != "pooling" and not self._compiled_tower_blocks
+        ):
             return
         mm_budget = getattr(self, "mm_budget", None)
         max_items = getattr(mm_budget, "mm_max_items_per_batch", None)

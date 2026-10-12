@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLIP boundary-LayerNorm workaround for Spyre.
+"""CLIP workarounds for Spyre: boundary LayerNorms and vision-tower compile.
 
 Only ``vision_model.pre_layrnorm``/``post_layernorm`` and
 ``text_model.final_layer_norm`` are swapped to ``SpyreLayerNorm``. Those three
@@ -28,131 +28,22 @@ replacement ``SpyreLayerNorm`` here copies the original's already-loaded
 weight/bias explicitly, rather than relying on a later ``load_weights()``
 pass to populate them.
 
-Also patches ``MMEncoderAttention._forward_sdpa`` with stick-aligned SDPA and
-compiles the vision encoder blocks.
+The vision tower's encoder layers are marked for the runner's per-block compile. Their
+body builds nothing on the host once ``MMEncoderAttention`` is Spyre's OOT
+implementation (``custom_ops/vit_attn.py``), so ``patch_vision_tower`` checks that
+instead of assuming it. It takes the tower itself, not the model, so a model that
+embeds a CLIP tower can reuse it.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+from spyre_inference.multimodal.utils import mark_blocks_compilable
 
 logger = init_logger(__name__)
-
-
-def patch_mm_encoder_attention() -> None:
-    """Replace ``MMEncoderAttention._forward_sdpa`` with a stick-aligned SDPA impl.
-
-    The replacement calls ``torch.ops.vllm.spyre_clip_attn_mask`` (a custom op
-    registered in ``custom_ops/vit_attn.py``) to obtain the additive mask opaquely,
-    then calls ``F.pad`` + ``F.scaled_dot_product_attention`` inline.
-
-    ``CLIPAttention.forward`` always calls ``self.attn(q, k, v)`` with no
-    ``cu_seqlens``; the replacement hardcodes ``cu_seqlens=None``.
-    """
-    try:
-        from vllm.model_executor.layers.attention.mm_encoder_attention import (
-            MMEncoderAttention,
-        )
-    except ImportError:
-        return
-
-    if getattr(MMEncoderAttention._forward_sdpa, "_spyre_patched", False):
-        return
-
-    from spyre_inference.custom_ops.vit_attn import _ensure_clip_attn_mask_registered
-
-    _ensure_clip_attn_mask_registered()
-
-    from spyre_inference.multimodal.utils import STICK, align_up
-
-    def _spyre_forward_sdpa(
-        self: MMEncoderAttention,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        bsz, q_len = query.size()[:2]
-        kv_len = key.size(1)
-        assert q_len == kv_len, (
-            f"_spyre_forward_sdpa assumes self-attention (q_len == kv_len) "
-            f"but got q_len={q_len}, kv_len={kv_len}"
-        )
-        is_reshaped = query.dim() != 4
-
-        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
-        q = query.transpose(1, 2)  # [B, H, S, D]
-        k = key.transpose(1, 2)
-        v = value.transpose(1, 2)
-
-        d = q.shape[-1]
-        seq_pad = align_up(q_len, STICK)
-        d_pad = align_up(d, STICK)
-        device = q.device
-
-        attn_mask = torch.ops.vllm.spyre_clip_attn_mask(q_len, bsz, seq_pad, q.dtype, device)  # ty: ignore[invalid-argument-type]
-
-        pad_needed = (seq_pad, d_pad) != (q_len, d)
-        if pad_needed:
-            pad = (0, d_pad - d, 0, seq_pad - q_len)
-            q = F.pad(q, pad)
-            k = F.pad(k, pad)
-            v = F.pad(v, pad)
-        else:
-            # Offset operands must be materialized (torch-spyre#3770).
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
-
-        if pad_needed:
-            out = out[:, :, :q_len, :d]
-
-        out = out.transpose(1, 2)
-
-        if is_reshaped:
-            out = out.reshape(bsz, q_len, -1)
-        return out
-
-    _spyre_forward_sdpa._spyre_patched = True
-    MMEncoderAttention._forward_sdpa = _spyre_forward_sdpa  # type: ignore[method-assign]
-    logger.info("Spyre: patched MMEncoderAttention._forward_sdpa with stick-aligned SDPA.")
-
-
-def _compile_vision_encoder_blocks(model: torch.nn.Module) -> None:
-    """Compile each ``CLIPEncoderLayer`` with ``fullgraph=True, dynamic=False``.
-
-    Vision tower blocks are excluded from the model-runner's block compilation
-    pass, so this function handles them explicitly. Aliased blocks (pipeline
-    parallelism) are compiled once. No-op when the tower or encoder is absent.
-    """
-    from spyre_inference.v1.worker import compile_guard
-
-    vision_model = getattr(model, "vision_model", None)
-    if vision_model is None:
-        return
-    encoder = getattr(vision_model, "encoder", None)
-    if encoder is None:
-        return
-    layers: nn.ModuleList | None = getattr(encoder, "layers", None)
-    if not layers:
-        return
-
-    seen: set[int] = set()
-    for block in layers:
-        if id(block) in seen:
-            continue
-        seen.add(id(block))
-        block.compile(backend="inductor", fullgraph=True, dynamic=False)
-        compile_guard.watch(block, f"{type(block).__name__} (CLIP vision block)")
-
-    logger.info("Spyre: compiled %d CLIPEncoderLayer block(s) for the vision tower.", len(seen))
 
 
 def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.nn.LayerNorm:
@@ -170,9 +61,36 @@ def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.
     return new_ln
 
 
+def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
+    """Swap a ``CLIPVisionTransformer``'s boundary LayerNorms and mark its encoder
+    layers compilable."""
+    pre_ln = getattr(tower, "pre_layrnorm", None)
+    if isinstance(pre_ln, torch.nn.LayerNorm):
+        tower.pre_layrnorm = _to_spyre_layer_norm(pre_ln, device)
+    post_ln = getattr(tower, "post_layernorm", None)
+    if isinstance(post_ln, torch.nn.LayerNorm):
+        tower.post_layernorm = _to_spyre_layer_norm(post_ln, device)
+
+    layers = getattr(getattr(tower, "encoder", None), "layers", None)
+    if not layers:
+        return
+    # Deferred: vit_attn imports this package's utils, so a top-level import is a cycle.
+    from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
+
+    # A layer whose attention is not the OOT impl would trace upstream's opaque SDPA
+    # wrapper, which pads nothing; leave such a tower eager.
+    attns = [getattr(getattr(layer, "self_attn", None), "attn", None) for layer in layers]
+    if all(isinstance(attn, SpyreMMEncoderAttention) for attn in attns):
+        mark_blocks_compilable(layers)
+    else:
+        logger.warning_once(
+            "Spyre: CLIP vision layers do not use SpyreMMEncoderAttention; the tower stays eager."
+        )
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place,
-    and compile the vision encoder blocks.
+    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place, and
+    mark the vision tower's encoder layers compilable.
 
     The ``isinstance`` checks are a second line of defense on top of the
     ``model_type == "clip"`` dispatch gate in ``multimodal/__init__.py``: they
@@ -187,18 +105,10 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
 
     vision_model = getattr(model, "vision_model", None)
     if vision_model is not None:
-        pre_ln = getattr(vision_model, "pre_layrnorm", None)
-        if isinstance(pre_ln, torch.nn.LayerNorm):
-            vision_model.pre_layrnorm = _to_spyre_layer_norm(pre_ln, device)
-        post_ln = getattr(vision_model, "post_layernorm", None)
-        if isinstance(post_ln, torch.nn.LayerNorm):
-            vision_model.post_layernorm = _to_spyre_layer_norm(post_ln, device)
+        patch_vision_tower(vision_model, device)
 
     logger.info_once(
         "Spyre: CLIP's boundary LayerNorms (pre_layrnorm/post_layernorm/"
         "final_layer_norm) use SpyreLayerNorm; layer_norm1/layer_norm2 inside "
         "encoder blocks are unaffected."
     )
-
-    patch_mm_encoder_attention()
-    _compile_vision_encoder_blocks(model)

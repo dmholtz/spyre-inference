@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from collections.abc import Iterable
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from spyre_inference.custom_ops.utils import convert
@@ -27,25 +28,32 @@ from spyre_inference.custom_ops.utils import convert
 # the sequence axis must land on it.
 STICK = 64
 
+# Set by a multimodal patch on the blocks whose body it made traceable; the runner
+# per-block compiles a tower's block list only when every block carries it.
+_BLOCK_COMPILABLE_ATTR = "_spyre_block_compilable"
+
 
 def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
 
 
+def mark_blocks_compilable(blocks: Iterable[nn.Module]) -> None:
+    """Opt a tower's blocks into the runner's per-block compile.
+
+    Only for a block body that builds no constant on the host: a CPU-resident buffer
+    has no device layout, so the graph would not lower. Mark every block of the list,
+    including any past the slice the forward runs: discovery needs all of them.
+    """
+    for block in blocks:
+        setattr(block, _BLOCK_COMPILABLE_ATTR, True)
+
+
+def blocks_marked_compilable(blocks: Iterable[nn.Module]) -> bool:
+    return all(getattr(b, _BLOCK_COMPILABLE_ATTR, False) for b in blocks)
+
+
 # Attribute under which a source mask caches its padded counterpart `(key, padded)`.
 _MASK_ATTR = "_spyre_padded_mask"
-_VISION_MASK_ATTR = "_spyre_vision_attn_mask"
-
-
-@lru_cache(maxsize=16)
-def _full_attend_mask_key(seq: int) -> torch.Tensor:
-    """Stable per-length tensor used as a cache handle by mask builders.
-
-    The same object is always returned for the same ``seq``, so callers can
-    attach cached masks via ``getattr``/``setattr`` without a separate dict.
-    Never moved to a device.
-    """
-    return torch.ones(seq, seq, dtype=torch.bool)
 
 
 def _padded_attn_mask(
