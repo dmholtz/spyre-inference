@@ -103,11 +103,8 @@ def _runner(
 
 
 def test_eager_pooling_does_not_run_the_vision_tower():
-    """An eager pooling load does not run the vision tower.
-
-    Those blocks crash, and a text-only load would die in the engine core
-    before the first prompt.
-    """
+    """An eager pooling load does not run the vision tower: only a compiled tower is
+    warmed, and an eager one compiles per op on first use regardless."""
     runner, vision = _runner("pooling", multimodal=True, max_items={"image": 4})
     runner.model_config.enforce_eager = True
     runner.max_num_reqs = 4

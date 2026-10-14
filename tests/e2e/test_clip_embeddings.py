@@ -154,21 +154,7 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(
-            True,
-            id="eager",
-            marks=pytest.mark.xfail(
-                reason="Eager CLIP vision blocks crash until the tower is compiled "
-                "(https://github.com/torch-spyre/spyre-inference/pull/1185)",
-                strict=True,
-            ),
-        ),
-        pytest.param(False, id="compiled", marks=pytest.mark.model_quality),
-    ],
-)
+@_EAGER_AND_COMPILED
 def test_clip_image_embedding_matches_hf(enforce_eager: bool) -> None:
     _skip_without_spyre()
     image = _synthetic_image()
