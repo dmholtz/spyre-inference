@@ -65,4 +65,9 @@ class SpyreMMEncoderAttention(MMEncoderAttention):
             scale=self.scale,
             enable_gqa=self.num_heads > self.num_kv_heads,
         ).transpose(1, 2)
-        return out.reshape(bsz, q_len, -1) if is_reshaped else out
+        out = out.reshape(bsz, q_len, -1) if is_reshaped else out
+        # padded_sdpa returns a strided slice when seq is not stick-aligned (e.g. CLIP's
+        # 50 patches). That staggered EA is incompatible with the residual's STANDARD EA
+        # in the encoder-layer residual add. Materialise here so the output always leaves
+        # attention with a clean STANDARD layout.
+        return out.contiguous()

@@ -18,8 +18,8 @@ All five LayerNorms -- ``pre_layrnorm``, ``post_layernorm``, ``final_layer_norm`
 and every ``CLIPEncoderLayer.layer_norm1``/``layer_norm2`` -- are swapped to
 ``SpyreLayerNorm``.
 
-**Why LayerNorm**: ``nn.LayerNorm`` dispatches through ``aten.layer_norm.default``,
-which torch-spyre decomposes via an ``_OPWrapper`` that unconditionally compiles
+**Why**: ``nn.LayerNorm`` dispatches through ``aten.layer_norm.default``, which
+torch-spyre decomposes via an ``_OPWrapper`` that unconditionally compiles
 ``spyre_layer_norm`` the first time it runs eagerly (regardless of
 ``--enforce-eager``).  For a second request with a different image-batch size the
 OPWrapper's Inductor graph recompiles, and the layout-propagation pass fails::
@@ -32,13 +32,6 @@ decomposition vs. the fp16 ``weight`` parameter (STANDARD layout).
 ``SpyreLayerNorm`` avoids this by implementing normalisation with plain fp32
 arithmetic (casting ``weight``/``bias`` to fp32 too) so both sides always share
 the same EA.
-
-**Why residual adds**: after the norm fix, the residual adds in each
-``CLIPEncoderLayer`` (``residual + attn_out`` and ``residual + mlp_out``) still
-crash with the same mixed-EA error in eager mode because the two operands come
-from separate OPWrapper graphs.  ``_patched_encoder_layer_forward`` replaces each
-add with ``layer_norm.fused_add(residual, out)``, which compiles ``a + b`` with
-``force=True`` so the layout pass sees both operands in one graph.
 
 Applied to the already-loaded model instance (weights included), so the
 replacement ``SpyreLayerNorm`` here copies the original's already-loaded
@@ -78,29 +71,6 @@ def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.
     return new_ln
 
 
-def _patched_encoder_layer_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """`CLIPEncoderLayer.forward` with fused residual adds via ``SpyreLayerNorm.fused_add``.
-
-    Mirrors the original exactly, but replaces each ``residual + out`` add with
-    ``layer_norm.fused_add(residual, out)``.  In eager mode the residual and the
-    attention/MLP output come from different OPWrapper compiled graphs whose Spyre
-    EAs are incompatible; ``fused_add`` compiles ``a + b`` with ``force=True`` so
-    the layout-propagation pass sees both operands in one graph and assigns them
-    compatible EAs.
-    """
-    # attention sub-block
-    residual = hidden_states
-    hidden_states, _ = self.self_attn(hidden_states=self.layer_norm1(hidden_states))
-    hidden_states = self.layer_norm1.fused_add(residual, hidden_states)
-
-    # feedforward sub-block
-    residual = hidden_states
-    hidden_states = self.mlp(self.layer_norm2(hidden_states))
-    hidden_states = self.layer_norm2.fused_add(residual, hidden_states)
-
-    return hidden_states
-
-
 def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
     """Swap ``CLIPVisionTransformer`` LayerNorms and mark its encoder layers compilable."""
     pre_ln = getattr(tower, "pre_layrnorm", None)
@@ -114,17 +84,11 @@ def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
     if not layers:
         return
 
-    # Swap layer_norm1/layer_norm2 and patch forward on every encoder block.
-    # SpyreLayerNorm.fused_add compiles the residual add with force=True so
-    # the layout pass sees both operands in one graph.
-    import types
-
     for layer in layers:
         for attr in ("layer_norm1", "layer_norm2"):
             ln = getattr(layer, attr, None)
             if isinstance(ln, torch.nn.LayerNorm):
                 setattr(layer, attr, _to_spyre_layer_norm(ln, device))
-        layer.forward = types.MethodType(_patched_encoder_layer_forward, layer)
 
     # Deferred: vit_attn imports this package's utils, so a top-level import is a cycle.
     from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
@@ -141,7 +105,7 @@ def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
 
 
 def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place, and
+    """Swap CLIP's boundary LayerNorms for ``SpyreLayerNorm``, in place, and
     mark the vision tower's encoder layers compilable.
 
     The ``isinstance`` checks are a second line of defense on top of the
@@ -159,7 +123,4 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     if vision_model is not None:
         patch_vision_tower(vision_model, device)
 
-    logger.info_once(
-        "Spyre: all CLIP LayerNorms use SpyreLayerNorm; encoder block forwards "
-        "patched to use fused_add for residual adds."
-    )
+    logger.info_once("Spyre: all CLIP LayerNorms use SpyreLayerNorm.")
