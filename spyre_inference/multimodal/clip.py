@@ -47,8 +47,11 @@ embeds a CLIP tower can reuse it.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 from spyre_inference.multimodal.utils import mark_blocks_compilable
@@ -71,6 +74,61 @@ def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.
     return new_ln
 
 
+def _make_compiled_forward(layer: torch.nn.Module) -> None:
+    """Attach a ``force=True`` compiled forward to an encoder layer.
+
+    In eager mode (``CompilationMode.NONE``) each op in the encoder layer is
+    compiled by torch-spyre's per-op OPWrapper as a separate tiny Inductor graph.
+    The residual adds (``residual + attn_out`` and ``residual + mlp_out``) then
+    receive one STANDARD-layout tensor and one staggered-EA tensor from separate
+    OPWrapper graphs, and the layout-propagation pass fails:
+
+        Multi-arg pointwise with mixed EA: STANDARD input arg1_1 must broadcast …
+
+    Compiling the entire ``forward`` with ``force=True`` puts every op -- the norm,
+    attention, and residual add -- into a single Inductor graph, so the layout pass
+    sees both operands of the add together and can assign compatible EAs.
+
+    Uses a per-layer ``_spyre_compiled_forward`` slot (not ``CompileOutermost``'s
+    shared ``spyre_compiled_kernel``) so it does not interfere with any other
+    ``CompileOutermost`` kernel on the layer.
+
+    In compiled block mode the layer's forward is already compiled by the runner's
+    ``block.compile()`` call; ``torch.compiler.is_compiling()`` is True inside that
+    graph, so this wrapper inlines transparently.
+    """
+    from spyre_inference.v1.worker import compile_guard
+
+    original_forward = layer.forward
+    layer._spyre_compiled_forward = None
+
+    @functools.wraps(original_forward)
+    def patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        if torch.compiler.is_compiling():
+            # Already inside a compiled graph (block compile or outer trace) --
+            # call the original forward directly so it inlines into that graph.
+            return original_forward(hidden_states)
+        compiled = layer._spyre_compiled_forward
+        if compiled is None:
+            compile_guard.watch(
+                original_forward,
+                f"{type(layer).__name__}.forward (encoder block)",
+            )
+            compiled = torch.compile(
+                original_forward,
+                backend=current_platform.simple_compile_backend,
+                fullgraph=True,
+                dynamic=False,
+            )
+            layer._spyre_compiled_forward = compiled
+        return compiled(hidden_states)
+
+    # Assign directly, not via types.MethodType: original_forward is already a bound
+    # method (closes over `layer`), and patched_forward closes over original_forward.
+    # Binding again via MethodType would prepend `layer` as an extra positional arg.
+    layer.forward = patched_forward
+
+
 def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
     """Swap ``CLIPVisionTransformer`` LayerNorms and mark its encoder layers compilable."""
     pre_ln = getattr(tower, "pre_layrnorm", None)
@@ -89,6 +147,7 @@ def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
             ln = getattr(layer, attr, None)
             if isinstance(ln, torch.nn.LayerNorm):
                 setattr(layer, attr, _to_spyre_layer_norm(ln, device))
+        _make_compiled_forward(layer)
 
     # Deferred: vit_attn imports this package's utils, so a top-level import is a cycle.
     from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
