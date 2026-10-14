@@ -65,4 +65,10 @@ class SpyreMMEncoderAttention(MMEncoderAttention):
             scale=self.scale,
             enable_gqa=self.num_heads > self.num_kv_heads,
         ).transpose(1, 2)
+        # padded_sdpa returns a strided slice [B, H, seq, d] when seq or d is not
+        # stick-aligned. After .transpose(1, 2) this becomes [B, seq, H, d] with
+        # non-contiguous strides, giving a staggered EA on Spyre. Materialise here
+        # so that the subsequent .reshape and any downstream pointwise ops (e.g.
+        # the encoder-layer residual add) see a STANDARD-layout tensor.
+        out = out.contiguous()
         return out.reshape(bsz, q_len, -1) if is_reshaped else out
