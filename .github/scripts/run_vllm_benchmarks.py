@@ -106,6 +106,14 @@ def parse_args():
         default="",
         help="comma-separated subset of latency,throughput,serve to run (empty = all)",
     )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default="",
+        help="config suite to run: empty for the CI configs (<type>-tests.yaml), "
+        "or e.g. 'dev' for <type>-tests-dev.yaml; a bench type with no file "
+        "for the suite is skipped, and a suite with no file at all is an error",
+    )
     return parser.parse_args()
 
 
@@ -594,6 +602,14 @@ def run_serve_benchmarks_from_file(
 VALID_BENCH_TYPES = ("latency", "throughput", "serve")
 
 
+def _suite_config_files(configs_dir: Path, suite: str, bench_types: set[str]) -> dict[str, Path]:
+    """Map each selected bench type to its `<type>-tests[-<suite>].yaml` config."""
+    suffix = f"-{suite}" if suite else ""
+    return {
+        b: configs_dir / f"{b}-tests{suffix}.yaml" for b in VALID_BENCH_TYPES if b in bench_types
+    }
+
+
 def main():
     # s390x: the protobuf upb C runtime SIGSEGVs (upb_DefPool_Free) in vLLM's
     # model-inspection child; force pure-Python protobuf. Set on os.environ so
@@ -620,13 +636,25 @@ def main():
     if not bench_types:
         bench_types = set(VALID_BENCH_TYPES)
 
+    suite = args.suite.strip()
+    config_files = _suite_config_files(configs_dir, suite, bench_types)
+    # A mistyped suite would otherwise run nothing and still exit 0.
+    if suite and not any(f.exists() for f in config_files.values()):
+        log.error(
+            "Suite %r has no config in %s: expected one of %s",
+            suite,
+            configs_dir,
+            [f.name for f in config_files.values()],
+        )
+        sys.exit(2)
+
     total_passed = 0
     total_failed = 0
 
     # Run latency benchmarks
     if "latency" in bench_types:
         passed, failed = run_benchmarks_from_file(
-            config_file=configs_dir / "latency-tests.yaml",
+            config_file=config_files["latency"],
             bench_type="latency",
             results_dir=results_dir,
             spyre_devices=args.spyre_devices,
@@ -640,7 +668,7 @@ def main():
     # Run throughput benchmarks
     if "throughput" in bench_types:
         passed, failed = run_benchmarks_from_file(
-            config_file=configs_dir / "throughput-tests.yaml",
+            config_file=config_files["throughput"],
             bench_type="throughput",
             results_dir=results_dir,
             spyre_devices=args.spyre_devices,
@@ -654,7 +682,7 @@ def main():
     # Run serve benchmarks (after latency/throughput to avoid port conflicts)
     if "serve" in bench_types:
         passed, failed = run_serve_benchmarks_from_file(
-            config_file=configs_dir / "serve-tests.yaml",
+            config_file=config_files["serve"],
             results_dir=results_dir,
             spyre_devices=args.spyre_devices,
             aiu_world_size=args.aiu_world_size,
