@@ -180,7 +180,9 @@ def padded_sdpa(
     )
 
     if padded:
-        # Offset-0 prefix slice, so torch-spyre#3770 cannot bite. Left as a view: the
-        # caller's transpose+reshape materializes it anyway.
-        out = out[:, :, :seq, :d]
+        # Offset-0 prefix slice, so torch-spyre#3770 cannot bite. Materialise with
+        # contiguous() so the Spyre layout pass assigns STANDARD EA to the output:
+        # a strided slice has a staggered EA that is incompatible with STANDARD-layout
+        # tensors in subsequent pointwise ops (e.g. the encoder-layer residual add).
+        out = out[:, :, :seq, :d].contiguous()
     return out
