@@ -736,9 +736,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
         if hasattr(self, "drafter"):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
+            logger.warning_once("Temporarily allow drafter model.")
 
         # Restore original RoPE frequencies and attention scale, and compensate
         # QK-norm epsilon for the padded head_dim. All passes are scoped to the
