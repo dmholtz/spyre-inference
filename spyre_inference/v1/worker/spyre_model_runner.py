@@ -1316,8 +1316,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
             if widest_hidden_states is not None:
+                hidden_size = widest_hidden_states.shape[1]
                 for rows in sorted(row_widths, reverse=True):
-                    self._dummy_sampler_run(widest_hidden_states[:rows])
+                    if rows <= widest_hidden_states.shape[0]:
+                        # Normal path: slice from the widest dummy hidden states.
+                        hs = widest_hidden_states[:rows]
+                    else:
+                        # Spec decode row widths can exceed max_num_seqs because the
+                        # verification forward pass produces (k+1) sampled rows per
+                        # request.  _dummy_run caps last_hidden_states at max_num_seqs
+                        # rows (one per request), so slicing can never reach these
+                        # wider shapes.  Build a zero tensor of the exact shape so
+                        # _SpyreModelWrapper.compute_logits sees and compiles the
+                        # correct lm_head input shape.  Values don't matter:
+                        # _dummy_sampler_run immediately replaces them with rand_like.
+                        hs = widest_hidden_states.new_zeros(rows, hidden_size)
+                    self._dummy_sampler_run(hs)
             self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
