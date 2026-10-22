@@ -379,6 +379,16 @@ class TorchSpyrePlatform(CpuPlatform):
 
             if compile_sizes:
                 max_capture_size = max(int(s) for s in compile_sizes)
+                # With speculative decoding the verification forward pass sends
+                # (num_spec_tokens + 1) tokens per request through the body —
+                # the real decode token plus all k draft tokens.  The scheduler
+                # budget must cover this enlarged body so that:
+                #   1. _dummy_run's assertion (num_tokens <= max_num_tokens) passes
+                #      for the spec decode body buckets added by SpyreShapeBucketer,
+                #   2. the scheduler sends the correct token budget at serving time.
+                spec_config = vllm_config.speculative_config
+                if spec_config is not None:
+                    max_capture_size *= spec_config.num_speculative_tokens + 1
                 # Scheduler must not send more tokens than the largest body bucket.
                 vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
                 logger.warning(
