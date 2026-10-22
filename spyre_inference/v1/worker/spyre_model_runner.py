@@ -138,6 +138,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_shape_tables,
     expand_packed_token_types,
     logits_row_buckets,
+    spec_decode_bucket_sizes,
 )
 
 logger = init_logger(__name__)
@@ -905,6 +906,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Shape bucketer for runtime dispatch (initialized after model load)
         self.spyre_shape_bucketer: SpyreShapeBucketer | None = None
+        # Spec-decode body token sizes derived from compile_sizes (Option B).
+        # Set once at the end of warming_up_model; empty list when not spec-decoding.
+        self._spec_decode_sizes: list[int] = []
 
         # Per-layer paged KV caches, kept so warmup can record the attention
         # kernels against real pages. Populated by initialize_kv_cache_tensors.
@@ -1279,11 +1283,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         bucket_sizes = self.spyre_shape_bucketer.bucket_sizes
+        # Spec-decode verification steps present (N+1) tokens per request.
+        # Derive separate body token sizes for those shapes so they are
+        # compiled independently of the base-decode buckets (Option B).
+        # Cached on the runner so _spyre_bucket_batch_descriptor can read it
+        # without recomputing on every dispatch call.
+        self._spec_decode_sizes = spec_decode_bucket_sizes(bucket_sizes, self.decode_query_len)
+        spec_sizes = self._spec_decode_sizes
         logger.info(
-            "Warming up model with %d bucket sizes [%d..%d]...",
+            "Warming up model with %d bucket sizes [%d..%d]%s...",
             len(bucket_sizes),
             bucket_sizes[0] if bucket_sizes else 0,
             bucket_sizes[-1] if bucket_sizes else 0,
+            f" + {len(spec_sizes)} spec-decode sizes {spec_sizes}" if spec_sizes else "",
         )
         row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs)
         t0 = time.time()
@@ -1297,6 +1309,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
+            # Spec-decode verification pass: each request contributes
+            # decode_query_len = N+1 tokens.  uniform_decode=True tells
+            # _dummy_run to lay out the dummy batch as
+            # (spec_size // decode_query_len) requests × decode_query_len
+            # tokens, exactly matching what a real verification step presents.
+            for spec_size in sorted(spec_sizes, reverse=True):
+                self._dummy_run(spec_size, uniform_decode=True)
             # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
             if widest_hidden_states is not None:
@@ -1305,9 +1324,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
-            "Warmup complete in %.3fs for %d buckets.",
+            "Warmup complete in %.3fs for %d buckets%s.",
             time.time() - t0,
             len(bucket_sizes),
+            f" + {len(spec_sizes)} spec-decode sizes" if spec_sizes else "",
         )
         self._record_attention_graphs()
         self._record_vision_graphs()
@@ -1620,10 +1640,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Decoder and pooling share this path; the buckets are ``compile_sizes``. Pooling
         declares just one of them, the token budget, so every pooling step pads to that
         same row count.
+
+        Spec-decode verification steps present exactly ``decode_query_len`` tokens per
+        request, so ``num_tokens`` is a multiple of ``decode_query_len``.  Those shapes
+        live in the derived spec-decode bucket list and are looked up by exact match
+        before falling through to the base-decode round-up.
         """
         del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
-        padded = bucketer.warmed_bucket(num_tokens) if bucketer is not None else None
+        if bucketer is None or not bucketer.is_warmed_up:
+            return None
+        # Check the spec-decode bucket list first (exact match).
+        if self._spec_decode_sizes:
+            padded = bucketer.find_spec_bucket(num_tokens, self._spec_decode_sizes)
+            if padded is not None:
+                return BatchDescriptor(num_tokens=padded)
+        # Fall through to the base-decode round-up.
+        padded = bucketer.warmed_bucket(num_tokens)
         return None if padded is None else BatchDescriptor(num_tokens=padded)
 
     @torch.inference_mode()

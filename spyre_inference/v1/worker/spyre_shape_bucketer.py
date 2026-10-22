@@ -417,6 +417,30 @@ def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[i
     return sorted({min(size, cap) for size in bucket_sizes if size > 0})
 
 
+def spec_decode_bucket_sizes(
+    base_sizes: Sequence[int], decode_query_len: int
+) -> list[int]:
+    """Spec-decode body token counts derived from ``base_sizes``.
+
+    Each base bucket ``S`` contributes ``floor(S / decode_query_len) *
+    decode_query_len`` tokens — the largest multiple of ``decode_query_len``
+    that fits inside ``S``.  This is the exact token count a verification batch
+    of ``floor(S / decode_query_len)`` requests produces (each contributing
+    ``decode_query_len = N + 1`` tokens).
+
+    Zero-valued entries (when ``S < decode_query_len``) and duplicates are
+    removed, and the result is sorted ascending so the bucketer can binary-
+    search it the same way it does ``bucket_sizes``.
+
+    Returns an empty list when ``decode_query_len <= 1`` (no spec decode).
+    """
+    if decode_query_len <= 1:
+        return []
+    return sorted(
+        {(s // decode_query_len) * decode_query_len for s in base_sizes if s >= decode_query_len}
+    )
+
+
 @dataclass(frozen=True)
 class SpyreBucketDescriptor:
     """Descriptor for a 1D (decoder) compilation bucket."""
@@ -507,6 +531,20 @@ class SpyreShapeBucketer:
         idx = bisect.bisect_left(self._bucket_sizes, num_tokens)
         if idx < len(self._bucket_sizes):
             return self._bucket_sizes[idx]
+        return None
+
+    def find_spec_bucket(self, num_tokens: int, spec_sizes: list[int]) -> int | None:
+        """Find the exact spec-decode bucket for ``num_tokens``, or None.
+
+        Unlike ``find_bucket``, this is an exact lookup: a verification batch
+        always arrives at a token count that is already a multiple of
+        ``decode_query_len``, so rounding up is not needed.  Returning None
+        for any other count lets the caller fall through to the base-decode
+        path.
+        """
+        idx = bisect.bisect_left(spec_sizes, num_tokens)
+        if idx < len(spec_sizes) and spec_sizes[idx] == num_tokens:
+            return num_tokens
         return None
 
     def warmed_bucket(self, num_tokens: int) -> int | None:
