@@ -219,6 +219,217 @@ _compute_slot_mapping_kernel = _SlotMappingKernelShim()
 _SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
 
 
+# ---------------------------------------------------------------------------
+# Pure-PyTorch rejection-sampler kernel replacements
+#
+# vLLM's rejection sampler uses Triton kernels for its hot loops.  On non-CUDA
+# platforms without a working Triton backend the CpuPlatform normally registers
+# C++ fallbacks (torch.ops._C.*).  Those C++ ops are part of vllm._C.abi3.so
+# which is not compiled when VLLM_TARGET_DEVICE=empty.  The four functions
+# below re-implement the same logic in pure PyTorch so that
+# TorchSpyrePlatform.register_triton_kernel_overrides() can register them
+# through the vllm.triton_utils.dispatcher without touching _C at all.
+#
+# All sampling operations happen on CPU tensors; Spyre is not involved.
+# ---------------------------------------------------------------------------
+
+
+def _spyre_expand_kernel_impl(
+    output_ptr: torch.Tensor,         # [num_tokens] – written in-place
+    input_ptr: torch.Tensor,          # [batch_size]
+    cu_num_tokens_ptr: torch.Tensor,  # [batch_size] cumulative token counts (int32/64)
+    replace_from: int,
+    replace_to: int,
+    MAX_NUM_TOKENS: int | None = None,  # constexpr in Triton; unused here
+) -> None:
+    """Scatter a per-request scalar into a flat per-token output tensor.
+
+    Mirrors the Triton expand_kernel: for each request req_idx the value
+    input_ptr[req_idx] (with replace_from→replace_to substitution) is
+    broadcast to output_ptr[start:end] where start/end come from cu_num_tokens_ptr.
+
+    Parameter names match the Triton kernel exactly so that KernelOverride sets
+    _forward_by_name=True and dispatches via **kwargs (by-name), not positionally.
+
+    Example: input=[a,b,c], cu_num_tokens=[2,5,6]
+             → output=[a,a,b,b,b,c]
+    """
+    batch_size = input_ptr.shape[0]
+    src = input_ptr.clone()
+    src = torch.where(src == replace_from, torch.tensor(replace_to, dtype=src.dtype), src)
+    cu = cu_num_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    for i in range(batch_size):
+        output_ptr[starts[i] : cu[i]] = src[i]
+
+
+def _spyre_rejection_greedy_sample_kernel_impl(
+    output_token_ids_ptr: torch.Tensor,          # [batch_size, max_spec_len+1]
+    cu_num_draft_tokens_ptr: torch.Tensor,       # [batch_size] cumulative
+    draft_token_ids_ptr: torch.Tensor,           # [num_tokens]
+    target_argmax_ptr: torch.Tensor,             # [num_tokens]  int64
+    bonus_token_ids_ptr: torch.Tensor,           # [batch_size]  int64
+    is_greedy_ptr: torch.Tensor | None,          # [batch_size]  bool, or None → all greedy
+    max_spec_len: int,
+    uniform_probs_ptr: torch.Tensor | None = None,               # synthetic mode only
+    synthetic_conditional_rates_ptr: torch.Tensor | None = None, # synthetic mode only
+    SYNTHETIC_MODE: bool = False,
+) -> None:
+    """Pure-PyTorch greedy rejection sampling.
+
+    Mirrors rejection_greedy_sample_kernel.  Parameter names match the Triton
+    kernel exactly (including _ptr suffix) so KernelOverride._forward_by_name
+    is True and dispatch uses **kwargs.
+
+    Token-by-token comparison of the draft id against the target argmax.
+    On the first mismatch the target argmax is written and iteration stops.
+    If all tokens are accepted the bonus token is appended.
+    """
+    batch_size = output_token_ids_ptr.shape[0]
+    cu = cu_num_draft_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    draft_ids = draft_token_ids_ptr.to(torch.int64)
+    tgt_argmax = target_argmax_ptr.to(torch.int64)
+    bonus = bonus_token_ids_ptr.to(torch.int64)
+
+    for req_idx in range(batch_size):
+        if is_greedy_ptr is not None and not is_greedy_ptr[req_idx].item():
+            continue  # handled by _rejection_random_sample
+        start = int(starts[req_idx].item())
+        end = int(cu[req_idx].item())
+        rejected = False
+        for pos in range(end - start):
+            if rejected:
+                break
+            draft_id = int(draft_ids[start + pos].item())
+            tgt_id = int(tgt_argmax[start + pos].item())
+            if (
+                SYNTHETIC_MODE
+                and uniform_probs_ptr is not None
+                and synthetic_conditional_rates_ptr is not None
+            ):
+                rate = float(synthetic_conditional_rates_ptr[pos].item())
+                prob = float(uniform_probs_ptr[start + pos].item())
+                accepted = (prob < rate) and draft_id >= 0
+                token_id = draft_id if accepted else tgt_id
+                rejected = not accepted
+            else:
+                token_id = tgt_id
+                rejected = draft_id != tgt_id
+            output_token_ids_ptr[req_idx, pos] = token_id
+        if not rejected:
+            output_token_ids_ptr[req_idx, end - start] = bonus[req_idx]
+
+
+def _spyre_rejection_random_sample_kernel_impl(
+    output_token_ids_ptr: torch.Tensor,          # [batch_size, max_spec_len+1]
+    cu_num_draft_tokens_ptr: torch.Tensor,       # [batch_size]
+    draft_token_ids_ptr: torch.Tensor,           # [num_tokens]
+    draft_probs_ptr: torch.Tensor | None,        # [num_tokens, vocab_size] or None
+    target_probs_ptr: torch.Tensor,              # [num_tokens, vocab_size]
+    bonus_token_ids_ptr: torch.Tensor,           # [batch_size]  int64
+    recovered_token_ids_ptr: torch.Tensor,       # [num_tokens]
+    uniform_probs_ptr: torch.Tensor,             # [num_tokens]  float64
+    is_greedy_ptr: torch.Tensor,                 # [batch_size]  bool
+    max_spec_len: int,
+    vocab_size: int,
+    synthetic_conditional_rates_ptr: torch.Tensor | None = None,
+    NO_DRAFT_PROBS: bool = False,
+    SYNTHETIC_MODE: bool = False,
+) -> None:
+    """Pure-PyTorch random (non-greedy) rejection sampling.
+
+    Mirrors rejection_random_sample_kernel.  Parameter names match the Triton
+    kernel exactly (including _ptr suffix and vocab_size) so KernelOverride.
+    _forward_by_name is True and dispatch uses **kwargs.
+
+    For each non-greedy request, accepts token i with probability
+    min(1, p_target / p_draft).  On rejection uses the pre-computed recovered token.
+    """
+    assert not SYNTHETIC_MODE, "Synthetic acceptance is not yet supported on Spyre"
+    batch_size = output_token_ids_ptr.shape[0]
+    cu = cu_num_draft_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    draft_ids = draft_token_ids_ptr.to(torch.int64)
+    recovered = recovered_token_ids_ptr.to(torch.int64)
+    bonus = bonus_token_ids_ptr.to(torch.int64)
+    u = uniform_probs_ptr.to(torch.float64)
+
+    for req_idx in range(batch_size):
+        if is_greedy_ptr[req_idx].item():
+            continue  # handled by _rejection_greedy_sample
+        start = int(starts[req_idx].item())
+        end = int(cu[req_idx].item())
+        rejected = False
+        for pos in range(end - start):
+            if rejected:
+                break
+            tok_idx = start + pos
+            draft_id = int(draft_ids[tok_idx].item())
+            up = float(u[tok_idx].item())
+            if draft_id < 0:
+                accepted = False
+            elif NO_DRAFT_PROBS:
+                t_prob = float(target_probs_ptr[tok_idx, draft_id].item())
+                accepted = t_prob >= up
+            else:
+                d_prob = float(draft_probs_ptr[tok_idx, draft_id].item())  # type: ignore[index]
+                t_prob = float(target_probs_ptr[tok_idx, draft_id].item())
+                accepted = d_prob > 0 and (t_prob / d_prob) >= up
+            if accepted:
+                output_token_ids_ptr[req_idx, pos] = draft_id
+            else:
+                rejected = True
+                output_token_ids_ptr[req_idx, pos] = recovered[tok_idx]
+        if not rejected:
+            output_token_ids_ptr[req_idx, end - start] = bonus[req_idx]
+
+
+def _spyre_sample_recovered_tokens_kernel_impl(
+    output_token_ids_ptr: torch.Tensor,   # [num_tokens]  – written in-place
+    cu_num_draft_tokens_ptr: torch.Tensor,  # [batch_size]
+    draft_token_ids_ptr: torch.Tensor,    # [num_tokens]
+    draft_probs_ptr: torch.Tensor | None, # [num_tokens, vocab_size] or None
+    target_probs_ptr: torch.Tensor,       # [num_tokens, vocab_size]
+    inv_q_ptr: torch.Tensor,              # [batch_size, vocab_size]  float32 or float64
+    vocab_size: int,
+    BLOCK_SIZE: int | None = None,        # Triton tile width; unused
+    NO_DRAFT_PROBS: bool = False,
+    USE_FP64_GUMBEL: bool = False,
+) -> None:
+    """Pure-PyTorch recovered-token sampling (Gumbel-argmax over residual dist).
+
+    Mirrors sample_recovered_tokens_kernel.  Parameter names match the Triton
+    kernel exactly so KernelOverride._forward_by_name is True.
+
+    For each rejected (request, draft-position), samples the recovered token
+    from max(p_target - p_draft, 0) * inv_q via argmax (Gumbel-max trick).
+    When NO_DRAFT_PROBS, excludes the draft token from the target distribution.
+    """
+    batch_size = cu_num_draft_tokens_ptr.shape[0]
+    cu = cu_num_draft_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    draft_ids = draft_token_ids_ptr.to(torch.int64)
+    dtype = torch.float64 if USE_FP64_GUMBEL else torch.float32
+    iq = inv_q_ptr.to(dtype)
+    tp = target_probs_ptr.to(dtype)
+    dp = draft_probs_ptr.to(dtype) if draft_probs_ptr is not None else None
+
+    for req_idx in range(batch_size):
+        start = int(starts[req_idx].item())
+        end = int(cu[req_idx].item())
+        for pos in range(end - start):
+            tok_idx = start + pos
+            if NO_DRAFT_PROBS:
+                residual = tp[tok_idx].clone()
+                residual[draft_ids[tok_idx]] = 0.0
+            else:
+                residual = torch.clamp(tp[tok_idx] - dp[tok_idx], min=0.0)  # type: ignore[index]
+            scores = residual * iq[req_idx]
+            recovered_id = min(int(torch.argmax(scores).item()), vocab_size - 1)
+            output_token_ids_ptr[tok_idx] = recovered_id
+
+
 def _patch_compute_slot_mapping() -> None:
     """Swap vLLM's slot-mapping kernel instance for our shim before any BlockTable exists.
 
