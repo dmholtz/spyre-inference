@@ -626,9 +626,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
         if hasattr(self, "drafter"):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
+            logger.warning_once("Temporarily allow drafter model.")
 
         fix_padded_model(self.model, self.model_config)
 
