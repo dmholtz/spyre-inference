@@ -1288,11 +1288,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # compiled independently of the base-decode buckets (Option B).
         # Cached on the runner so _spyre_bucket_batch_descriptor can read it
         # without recomputing on every dispatch call.
-        # NOTE: decode_query_len is set by load_model(), which runs before
-        # warming_up_model().  However, it equals num_speculative_steps + 1,
-        # and num_speculative_steps is available from __init__, so we compute
-        # the same value directly to avoid depending on attribute order.
-        spec_decode_query_len = self.num_speculative_steps + 1
+        # NOTE: Use vllm_config directly — decode_query_len and
+        # num_speculative_steps are both set during load_model(), so neither
+        # is guaranteed to exist here.  vllm_config is always available.
+        spec_decode_query_len = self.vllm_config.num_speculative_tokens + 1
         self._spec_decode_sizes = spec_decode_bucket_sizes(bucket_sizes, spec_decode_query_len)
         spec_sizes = self._spec_decode_sizes
         logger.info(
