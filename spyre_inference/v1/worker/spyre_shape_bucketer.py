@@ -411,9 +411,19 @@ def encoder_grid_source_rows(
     return rows
 
 
-def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
-    """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
-    cap = max(1, max_num_reqs)
+def logits_row_buckets(
+    bucket_sizes: Sequence[int],
+    max_num_reqs: int,
+    num_spec_tokens: int = 0,
+) -> list[int]:
+    """Row widths the lm_head can see: each body bucket clipped to the max row count.
+
+    Without speculative decoding the maximum row count reaching ``compute_logits``
+    is ``max_num_reqs`` (one sampled row per request).  With speculative decoding
+    each request contributes up to ``num_spec_tokens + 1`` rows (one per draft
+    token plus the bonus token), so the cap is ``max_num_reqs * (num_spec_tokens + 1)``.
+    """
+    cap = max(1, max_num_reqs) * (num_spec_tokens + 1)
     return sorted({min(size, cap) for size in bucket_sizes if size > 0})
 
 
@@ -431,6 +441,20 @@ class SpyreShapeBucketer:
     def __init__(self, vllm_config: VllmConfig) -> None:
         compilation_config = vllm_config.compilation_config
         sizes: list[int] = [int(s) for s in (compilation_config.compile_sizes or [])]
+
+        # Speculative decoding verification passes (num_spec_tokens + 1) tokens
+        # per request through the transformer body in a single forward call —
+        # one real decode token plus each draft token.  The resulting body token
+        # counts are not covered by the base compile_sizes (which are sized for
+        # one token per request), so each base size scaled by (k + 1) must be
+        # compiled and warmed explicitly to prevent on-the-fly recompilations
+        # at serving time.
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None:
+            k = spec_config.num_speculative_tokens
+            spec_sizes = [s * (k + 1) for s in sizes]
+            sizes = sorted(set(sizes) | set(spec_sizes))
+
         self._bucket_sizes = sorted(sizes)
         self._max_bucket_size = self._bucket_sizes[-1] if self._bucket_sizes else 0
         self._is_warmed_up = False
