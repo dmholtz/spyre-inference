@@ -418,7 +418,7 @@ def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[i
 
 
 def spec_decode_bucket_sizes(
-    base_sizes: Sequence[int], decode_query_len: int
+    base_sizes: Sequence[int], decode_query_len: int, max_num_reqs: int
 ) -> list[int]:
     """Spec-decode body token counts derived from ``base_sizes``.
 
@@ -428,6 +428,12 @@ def spec_decode_bucket_sizes(
     of ``floor(S / decode_query_len)`` requests produces (each contributing
     ``decode_query_len = N + 1`` tokens).
 
+    The derived size is additionally capped at ``max_num_reqs *
+    decode_query_len``: ``_dummy_run`` distributes tokens as
+    ``min(max_num_reqs, size // decode_query_len)`` requests, so any size
+    larger than that cap would leave ``sum(scheduled_tokens) < num_tokens``
+    and trigger an AssertionError inside the upstream dummy-run path.
+
     Zero-valued entries (when ``S < decode_query_len``) and duplicates are
     removed, and the result is sorted ascending so the bucketer can binary-
     search it the same way it does ``bucket_sizes``.
@@ -436,8 +442,13 @@ def spec_decode_bucket_sizes(
     """
     if decode_query_len <= 1:
         return []
+    cap = max_num_reqs * decode_query_len
     return sorted(
-        {(s // decode_query_len) * decode_query_len for s in base_sizes if s >= decode_query_len}
+        {
+            min((s // decode_query_len) * decode_query_len, cap)
+            for s in base_sizes
+            if s >= decode_query_len
+        }
     )
 
 

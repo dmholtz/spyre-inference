@@ -1292,7 +1292,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # num_speculative_steps are both set during load_model(), so neither
         # is guaranteed to exist here.  vllm_config is always available.
         spec_decode_query_len = self.vllm_config.num_speculative_tokens + 1
-        self._spec_decode_sizes = spec_decode_bucket_sizes(bucket_sizes, spec_decode_query_len)
+        self._spec_decode_sizes = spec_decode_bucket_sizes(
+            bucket_sizes, spec_decode_query_len, self.max_num_reqs
+        )
         spec_sizes = self._spec_decode_sizes
         logger.info(
             "Warming up model with %d bucket sizes [%d..%d]%s...",
