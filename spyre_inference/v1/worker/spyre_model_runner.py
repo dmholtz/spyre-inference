@@ -254,9 +254,9 @@ _SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
 
 
 def _spyre_expand_kernel_impl(
-    output: torch.Tensor,      # [num_tokens] – written in-place
-    input_val: torch.Tensor,   # [batch_size]
-    cu_num_tokens: torch.Tensor,  # [batch_size] cumulative token counts (int32/64)
+    output_ptr: torch.Tensor,         # [num_tokens] – written in-place
+    input_ptr: torch.Tensor,          # [batch_size]
+    cu_num_tokens_ptr: torch.Tensor,  # [batch_size] cumulative token counts (int32/64)
     replace_from: int,
     replace_to: int,
     MAX_NUM_TOKENS: int | None = None,  # constexpr in Triton; unused here
@@ -264,54 +264,55 @@ def _spyre_expand_kernel_impl(
     """Scatter a per-request scalar into a flat per-token output tensor.
 
     Mirrors the Triton expand_kernel: for each request req_idx the value
-    input_val[req_idx] (with replace_from→replace_to substitution) is
-    broadcast to output[start:end] where start/end come from cu_num_tokens.
+    input_ptr[req_idx] (with replace_from→replace_to substitution) is
+    broadcast to output_ptr[start:end] where start/end come from cu_num_tokens_ptr.
+
+    Parameter names match the Triton kernel exactly so that KernelOverride sets
+    _forward_by_name=True and dispatches via **kwargs (by-name), not positionally.
 
     Example: input=[a,b,c], cu_num_tokens=[2,5,6]
              → output=[a,a,b,b,b,c]
     """
-    batch_size = input_val.shape[0]
-    src = input_val.clone()
-    # Apply scalar replacement before broadcasting.
+    batch_size = input_ptr.shape[0]
+    src = input_ptr.clone()
     src = torch.where(src == replace_from, torch.tensor(replace_to, dtype=src.dtype), src)
-
-    cu = cu_num_tokens.to(torch.int64)
-    starts = torch.cat([cu.new_zeros(1), cu[:-1]])  # [batch_size]
+    cu = cu_num_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
     for i in range(batch_size):
-        output[starts[i] : cu[i]] = src[i]
+        output_ptr[starts[i] : cu[i]] = src[i]
 
 
 def _spyre_rejection_greedy_sample_kernel_impl(
-    output_token_ids: torch.Tensor,       # [batch_size, max_spec_len+1]  int32/64
-    cu_num_draft_tokens: torch.Tensor,    # [batch_size]  cumulative
-    draft_token_ids: torch.Tensor,        # [num_tokens]  int32/64
-    target_argmax: torch.Tensor,          # [num_tokens]  int64
-    bonus_token_ids: torch.Tensor,        # [batch_size]  int64
-    is_greedy: torch.Tensor | None,       # [batch_size]  bool, or None → all greedy
+    output_token_ids_ptr: torch.Tensor,          # [batch_size, max_spec_len+1]
+    cu_num_draft_tokens_ptr: torch.Tensor,       # [batch_size] cumulative
+    draft_token_ids_ptr: torch.Tensor,           # [num_tokens]
+    target_argmax_ptr: torch.Tensor,             # [num_tokens]  int64
+    bonus_token_ids_ptr: torch.Tensor,           # [batch_size]  int64
+    is_greedy_ptr: torch.Tensor | None,          # [batch_size]  bool, or None → all greedy
     max_spec_len: int,
-    uniform_probs: torch.Tensor | None = None,              # synthetic mode only
-    synthetic_conditional_rates: torch.Tensor | None = None,  # synthetic mode only
+    uniform_probs_ptr: torch.Tensor | None = None,               # synthetic mode only
+    synthetic_conditional_rates_ptr: torch.Tensor | None = None, # synthetic mode only
     SYNTHETIC_MODE: bool = False,
 ) -> None:
     """Pure-PyTorch greedy rejection sampling.
 
-    Mirrors rejection_greedy_sample_kernel: token-by-token comparison of the
-    draft id against the target argmax.  On the first mismatch the target
-    argmax is written and iteration stops (no further output slots are filled).
-    If all tokens are accepted the bonus token is appended.
-    Synthetic mode accepts based on a per-position rate drawn from
-    uniform_probs instead of exact match.
-    """
-    batch_size = output_token_ids.shape[0]
-    cu = cu_num_draft_tokens.to(torch.int64)
-    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    Mirrors rejection_greedy_sample_kernel.  Parameter names match the Triton
+    kernel exactly (including _ptr suffix) so KernelOverride._forward_by_name
+    is True and dispatch uses **kwargs.
 
-    draft_ids = draft_token_ids.to(torch.int64)
-    tgt_argmax = target_argmax.to(torch.int64)
-    bonus = bonus_token_ids.to(torch.int64)
+    Token-by-token comparison of the draft id against the target argmax.
+    On the first mismatch the target argmax is written and iteration stops.
+    If all tokens are accepted the bonus token is appended.
+    """
+    batch_size = output_token_ids_ptr.shape[0]
+    cu = cu_num_draft_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    draft_ids = draft_token_ids_ptr.to(torch.int64)
+    tgt_argmax = target_argmax_ptr.to(torch.int64)
+    bonus = bonus_token_ids_ptr.to(torch.int64)
 
     for req_idx in range(batch_size):
-        if is_greedy is not None and not is_greedy[req_idx].item():
+        if is_greedy_ptr is not None and not is_greedy_ptr[req_idx].item():
             continue  # handled by _rejection_random_sample
         start = int(starts[req_idx].item())
         end = int(cu[req_idx].item())
@@ -321,54 +322,60 @@ def _spyre_rejection_greedy_sample_kernel_impl(
                 break
             draft_id = int(draft_ids[start + pos].item())
             tgt_id = int(tgt_argmax[start + pos].item())
-            if SYNTHETIC_MODE and uniform_probs is not None and synthetic_conditional_rates is not None:
-                rate = float(synthetic_conditional_rates[pos].item())
-                prob = float(uniform_probs[start + pos].item())
+            if (
+                SYNTHETIC_MODE
+                and uniform_probs_ptr is not None
+                and synthetic_conditional_rates_ptr is not None
+            ):
+                rate = float(synthetic_conditional_rates_ptr[pos].item())
+                prob = float(uniform_probs_ptr[start + pos].item())
                 accepted = (prob < rate) and draft_id >= 0
                 token_id = draft_id if accepted else tgt_id
                 rejected = not accepted
             else:
                 token_id = tgt_id
                 rejected = draft_id != tgt_id
-            output_token_ids[req_idx, pos] = token_id
+            output_token_ids_ptr[req_idx, pos] = token_id
         if not rejected:
-            output_token_ids[req_idx, end - start] = bonus[req_idx]
+            output_token_ids_ptr[req_idx, end - start] = bonus[req_idx]
 
 
 def _spyre_rejection_random_sample_kernel_impl(
-    output_token_ids: torch.Tensor,       # [batch_size, max_spec_len+1]  int32
-    cu_num_draft_tokens: torch.Tensor,    # [batch_size]
-    draft_token_ids: torch.Tensor,        # [num_tokens]  int32
-    draft_probs: torch.Tensor | None,     # [num_tokens, vocab_size]  float32  or None
-    target_probs: torch.Tensor,           # [num_tokens, vocab_size]  float32
-    bonus_token_ids: torch.Tensor,        # [batch_size]  int64
-    recovered_token_ids: torch.Tensor,    # [num_tokens]  int32
-    uniform_probs: torch.Tensor,          # [num_tokens]  float64
-    is_greedy: torch.Tensor,              # [batch_size]  bool
+    output_token_ids_ptr: torch.Tensor,          # [batch_size, max_spec_len+1]
+    cu_num_draft_tokens_ptr: torch.Tensor,       # [batch_size]
+    draft_token_ids_ptr: torch.Tensor,           # [num_tokens]
+    draft_probs_ptr: torch.Tensor | None,        # [num_tokens, vocab_size] or None
+    target_probs_ptr: torch.Tensor,              # [num_tokens, vocab_size]
+    bonus_token_ids_ptr: torch.Tensor,           # [batch_size]  int64
+    recovered_token_ids_ptr: torch.Tensor,       # [num_tokens]
+    uniform_probs_ptr: torch.Tensor,             # [num_tokens]  float64
+    is_greedy_ptr: torch.Tensor,                 # [batch_size]  bool
     max_spec_len: int,
-    synthetic_conditional_rates: torch.Tensor | None = None,
+    vocab_size: int,
+    synthetic_conditional_rates_ptr: torch.Tensor | None = None,
     NO_DRAFT_PROBS: bool = False,
     SYNTHETIC_MODE: bool = False,
 ) -> None:
     """Pure-PyTorch random (non-greedy) rejection sampling.
 
-    Mirrors rejection_random_sample_kernel.  For each non-greedy request,
-    iterates draft positions; accepts token i with probability
-    min(1, p_target / p_draft).  On rejection uses the recovered token
-    (pre-computed by sample_recovered_tokens).
+    Mirrors rejection_random_sample_kernel.  Parameter names match the Triton
+    kernel exactly (including _ptr suffix and vocab_size) so KernelOverride.
+    _forward_by_name is True and dispatch uses **kwargs.
+
+    For each non-greedy request, accepts token i with probability
+    min(1, p_target / p_draft).  On rejection uses the pre-computed recovered token.
     """
     assert not SYNTHETIC_MODE, "Synthetic acceptance is not yet supported on Spyre"
-    batch_size = output_token_ids.shape[0]
-    cu = cu_num_draft_tokens.to(torch.int64)
+    batch_size = output_token_ids_ptr.shape[0]
+    cu = cu_num_draft_tokens_ptr.to(torch.int64)
     starts = torch.cat([cu.new_zeros(1), cu[:-1]])
-
-    draft_ids = draft_token_ids.to(torch.int64)
-    recovered = recovered_token_ids.to(torch.int64)
-    bonus = bonus_token_ids.to(torch.int64)
-    u = uniform_probs.to(torch.float64)
+    draft_ids = draft_token_ids_ptr.to(torch.int64)
+    recovered = recovered_token_ids_ptr.to(torch.int64)
+    bonus = bonus_token_ids_ptr.to(torch.int64)
+    u = uniform_probs_ptr.to(torch.float64)
 
     for req_idx in range(batch_size):
-        if is_greedy[req_idx].item():
+        if is_greedy_ptr[req_idx].item():
             continue  # handled by _rejection_greedy_sample
         start = int(starts[req_idx].item())
         end = int(cu[req_idx].item())
@@ -382,52 +389,50 @@ def _spyre_rejection_random_sample_kernel_impl(
             if draft_id < 0:
                 accepted = False
             elif NO_DRAFT_PROBS:
-                t_prob = float(target_probs[tok_idx, draft_id].item())
+                t_prob = float(target_probs_ptr[tok_idx, draft_id].item())
                 accepted = t_prob >= up
             else:
-                d_prob = float(draft_probs[tok_idx, draft_id].item())  # type: ignore[index]
-                t_prob = float(target_probs[tok_idx, draft_id].item())
+                d_prob = float(draft_probs_ptr[tok_idx, draft_id].item())  # type: ignore[index]
+                t_prob = float(target_probs_ptr[tok_idx, draft_id].item())
                 accepted = d_prob > 0 and (t_prob / d_prob) >= up
             if accepted:
-                output_token_ids[req_idx, pos] = draft_id
+                output_token_ids_ptr[req_idx, pos] = draft_id
             else:
                 rejected = True
-                output_token_ids[req_idx, pos] = recovered[tok_idx]
+                output_token_ids_ptr[req_idx, pos] = recovered[tok_idx]
         if not rejected:
-            output_token_ids[req_idx, end - start] = bonus[req_idx]
+            output_token_ids_ptr[req_idx, end - start] = bonus[req_idx]
 
 
 def _spyre_sample_recovered_tokens_kernel_impl(
-    output_token_ids: torch.Tensor,     # [num_tokens]  int32  – written in-place
-    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
-    draft_token_ids: torch.Tensor,      # [num_tokens]  int32
-    draft_probs: torch.Tensor | None,   # [num_tokens, vocab_size]  float32  or None
-    target_probs: torch.Tensor,         # [num_tokens, vocab_size]  float32
-    inv_q: torch.Tensor,                # [batch_size, vocab_size]  float32 or float64
+    output_token_ids_ptr: torch.Tensor,   # [num_tokens]  – written in-place
+    cu_num_draft_tokens_ptr: torch.Tensor,  # [batch_size]
+    draft_token_ids_ptr: torch.Tensor,    # [num_tokens]
+    draft_probs_ptr: torch.Tensor | None, # [num_tokens, vocab_size] or None
+    target_probs_ptr: torch.Tensor,       # [num_tokens, vocab_size]
+    inv_q_ptr: torch.Tensor,              # [batch_size, vocab_size]  float32 or float64
     vocab_size: int,
-    BLOCK_SIZE: int | None = None,      # Triton tile width; unused
+    BLOCK_SIZE: int | None = None,        # Triton tile width; unused
     NO_DRAFT_PROBS: bool = False,
     USE_FP64_GUMBEL: bool = False,
 ) -> None:
     """Pure-PyTorch recovered-token sampling (Gumbel-argmax over residual dist).
 
-    Mirrors sample_recovered_tokens_kernel.  For each (request, draft-position)
-    pair that was rejected, samples the recovered token from the residual
-    distribution  max(p_target - p_draft, 0)  using the pre-computed inv_q
-    Gumbel noise: recovered = argmax(residual * inv_q).
-    When NO_DRAFT_PROBS the draft probability is treated as 1 and the chosen
-    token is excluded (standard greedy-draft recovery = sample from target
-    excluding the draft token).
-    """
-    batch_size = cu_num_draft_tokens.shape[0]
-    cu = cu_num_draft_tokens.to(torch.int64)
-    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    Mirrors sample_recovered_tokens_kernel.  Parameter names match the Triton
+    kernel exactly so KernelOverride._forward_by_name is True.
 
-    draft_ids = draft_token_ids.to(torch.int64)
+    For each rejected (request, draft-position), samples the recovered token
+    from max(p_target - p_draft, 0) * inv_q via argmax (Gumbel-max trick).
+    When NO_DRAFT_PROBS, excludes the draft token from the target distribution.
+    """
+    batch_size = cu_num_draft_tokens_ptr.shape[0]
+    cu = cu_num_draft_tokens_ptr.to(torch.int64)
+    starts = torch.cat([cu.new_zeros(1), cu[:-1]])
+    draft_ids = draft_token_ids_ptr.to(torch.int64)
     dtype = torch.float64 if USE_FP64_GUMBEL else torch.float32
-    iq = inv_q.to(dtype)
-    tp = target_probs.to(dtype)
-    dp = draft_probs.to(dtype) if draft_probs is not None else None
+    iq = inv_q_ptr.to(dtype)
+    tp = target_probs_ptr.to(dtype)
+    dp = draft_probs_ptr.to(dtype) if draft_probs_ptr is not None else None
 
     for req_idx in range(batch_size):
         start = int(starts[req_idx].item())
@@ -435,15 +440,13 @@ def _spyre_sample_recovered_tokens_kernel_impl(
         for pos in range(end - start):
             tok_idx = start + pos
             if NO_DRAFT_PROBS:
-                # Exclude the draft token from the target distribution.
                 residual = tp[tok_idx].clone()
                 residual[draft_ids[tok_idx]] = 0.0
             else:
                 residual = torch.clamp(tp[tok_idx] - dp[tok_idx], min=0.0)  # type: ignore[index]
             scores = residual * iq[req_idx]
-            recovered_id = int(torch.argmax(scores).item())
-            recovered_id = min(recovered_id, vocab_size - 1)
-            output_token_ids[tok_idx] = recovered_id
+            recovered_id = min(int(torch.argmax(scores).item()), vocab_size - 1)
+            output_token_ids_ptr[tok_idx] = recovered_id
 
 
 def _patch_compute_slot_mapping() -> None:
