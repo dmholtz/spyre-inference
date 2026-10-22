@@ -632,9 +632,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
         if hasattr(self, "drafter"):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
+            logger.warning_once("Temporarily allow drafter model.")
 
         fix_padded_model(self.model, self.model_config)
 
@@ -1084,7 +1082,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        if self.speculative_config is not None:
+        # Model-free proposers (ngram, suffix) have no draft attention layers.
+        if self.speculative_config is not None and self.speculative_config.uses_draft_kv_cache():
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(
