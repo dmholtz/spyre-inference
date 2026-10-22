@@ -234,6 +234,54 @@ class TorchSpyrePlatform(CpuPlatform):
         pass
 
     @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        """Register pure-PyTorch replacements for every Triton kernel that
+        vLLM's CpuPlatform would otherwise cover with torch.ops._C shims.
+
+        CpuPlatform.register_triton_kernel_overrides() delegates to C++ ops
+        inside vllm._C.abi3.so, which is not compiled for
+        VLLM_TARGET_DEVICE=empty.  We provide our own pure-PyTorch
+        implementations so that speculative-decoding warmup (and any other
+        Triton-kernel call path) works without _C on this platform.
+
+        The slot-mapping kernel is handled separately via
+        _patch_compute_slot_mapping() (called from SpyreModelRunner.__init__)
+        because it is a JIT-warmup-owner, not a plain module-level function,
+        and requires a shim with a register_warmup() no-op; that path is
+        kept as-is rather than migrated here.
+        """
+        from vllm.triton_utils import HAS_TRITON
+        from vllm.triton_utils.dispatcher import register_kernels
+
+        if HAS_TRITON:
+            # Real Triton kernels can execute natively; overrides would shadow them.
+            return
+
+        from spyre_inference.v1.worker.spyre_model_runner import (
+            _spyre_expand_kernel_impl,
+            _spyre_rejection_greedy_sample_kernel_impl,
+            _spyre_rejection_random_sample_kernel_impl,
+            _spyre_sample_recovered_tokens_kernel_impl,
+        )
+
+        register_kernels(
+            {
+                "vllm.v1.sample.rejection_sampler.expand_kernel": (
+                    _spyre_expand_kernel_impl
+                ),
+                "vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel": (
+                    _spyre_rejection_greedy_sample_kernel_impl
+                ),
+                "vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel": (
+                    _spyre_rejection_random_sample_kernel_impl
+                ),
+                "vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel": (
+                    _spyre_sample_recovered_tokens_kernel_impl
+                ),
+            }
+        )
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 
