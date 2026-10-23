@@ -388,12 +388,40 @@ class TorchSpyrePlatform(CpuPlatform):
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
                 # Decode packs one token per running sequence; prefill lands on
                 # the single largest bucket. Denser sizes only cost warmup time.
+                #
+                # With speculative decoding (S_max draft tokens per sequence),
+                # a decode step with B active sequences and S accepted drafts
+                # sends B*(1+S) tokens to the body. We need a compiled bucket
+                # for every reachable (B, S) pair so the body graph never
+                # recompiles at runtime:
+                #   { B*(1+S) : B in powers-of-two up to num_seqs,
+                #               S in [0, S_max] }
+                # When S_max=0 (no spec-decode) the inner loop is a single
+                # iteration over S=0 and the set collapses to the original
+                # {1, 2, 4, …, num_seqs, prefill_max}.
+                spec_config = vllm_config.speculative_config
+                num_spec = (
+                    spec_config.num_speculative_tokens
+                    if spec_config is not None
+                    else 0
+                )
                 max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                sizes = {max_capture_size, num_seqs}
+                # Seed with the two original anchor points: the prefill bucket
+                # and num_seqs itself (handles non-power-of-two max_num_seqs).
+                # The loop below adds powers-of-two below num_seqs for S=0,
+                # and their speculative multiples B*(1+S) for S>0.
+                sizes: set[int] = {max_capture_size}
+                for s in range(num_spec + 1):
+                    token_count = num_seqs * (1 + s)
+                    if token_count <= max_capture_size:
+                        sizes.add(token_count)
                 size = 1
                 while size < num_seqs:
-                    sizes.add(size)
+                    for s in range(num_spec + 1):
+                        token_count = size * (1 + s)
+                        if token_count <= max_capture_size:
+                            sizes.add(token_count)
                     size *= 2
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes

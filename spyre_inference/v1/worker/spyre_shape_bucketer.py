@@ -411,9 +411,21 @@ def encoder_grid_source_rows(
     return rows
 
 
-def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
-    """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
-    cap = max(1, max_num_reqs)
+def logits_row_buckets(
+    bucket_sizes: Sequence[int],
+    max_num_reqs: int,
+    max_spec_tokens: int = 0,
+) -> list[int]:
+    """Row widths the lm_head can see: each body bucket clipped to the row cap.
+
+    Without speculative decoding each sequence contributes one logit row, so
+    the cap is ``max_num_reqs``.  With speculative decoding each sequence
+    contributes up to ``1 + max_spec_tokens`` rows (S draft positions plus the
+    bonus position), so the cap is ``max_num_reqs * (1 + max_spec_tokens)``.
+    Every body bucket that exceeds this cap is clipped to it, deduplicated, and
+    sorted so the lm_head warms exactly the widths it will see at runtime.
+    """
+    cap = max(1, max_num_reqs) * (1 + max(0, max_spec_tokens))
     return sorted({min(size, cap) for size in bucket_sizes if size > 0})
 
 

@@ -46,6 +46,8 @@ def make_config(
     config.model_config.runner_type = runner_type
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
+    # Explicitly None so SpyreAttnBucketer reads num_spec=0 (no spec-decode).
+    config.speculative_config = None
 
     arch = config.model_config.model_arch_config
     if per_layer_kv_heads is None:
