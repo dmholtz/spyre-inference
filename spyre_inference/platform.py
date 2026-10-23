@@ -365,15 +365,26 @@ class TorchSpyrePlatform(CpuPlatform):
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
-                # Decode packs one token per running sequence; prefill lands on
-                # the single largest bucket. Denser sizes only cost warmup time.
+                # Decode packs one token per running sequence (or S+1 tokens
+                # under speculative decoding); prefill lands on the single
+                # largest bucket. Denser sizes only cost warmup time.
+                spec_cfg = getattr(vllm_config, "speculative_config", None)
+                num_spec = 0
+                if spec_cfg is not None:
+                    if isinstance(spec_cfg, dict):
+                        num_spec = int(spec_cfg.get("num_speculative_tokens", 0) or 0)
+                    else:
+                        num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
                 max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                sizes = {max_capture_size, num_seqs}
+                max_decode_tokens = min(num_seqs * (num_spec + 1), max_capture_size)
+                sizes = {max_capture_size, max_decode_tokens}
                 size = 1
-                while size < num_seqs:
+                while size < max_decode_tokens:
                     sizes.add(size)
                     size *= 2
+                if size <= max_capture_size:
+                    sizes.add(size)
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 

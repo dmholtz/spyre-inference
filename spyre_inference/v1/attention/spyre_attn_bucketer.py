@@ -218,14 +218,24 @@ class SpyreAttnBucketer:
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
-        # build()) then multiples of a step up to max_num_batched_tokens, the
+        # build()), intermediate speculative verification lengths [2..num_spec+1],
+        # then multiples of a step up to max_num_batched_tokens, the
         # query lengths a prefill pads up to.
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        num_spec = 0
+        if spec_cfg is not None:
+            if isinstance(spec_cfg, dict):
+                num_spec = int(spec_cfg.get("num_speculative_tokens", 0) or 0)
+            else:
+                num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
+        spec_queries = set(range(1, num_spec + 2)) if num_spec > 0 else {1}
         self._query_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_QUERY_BUCKETS,
             max_batched,
             "SPYRE_ATTN_QUERY_BUCKETS",
-            lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
+            lambda: sorted(spec_queries | set(range(step, max_batched + 1, step)) | {max_batched}),
         )
 
         # Default: powers of two from block_size up to max_model_len. Geometric
