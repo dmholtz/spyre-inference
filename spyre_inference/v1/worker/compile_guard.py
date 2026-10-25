@@ -288,10 +288,12 @@ class _CompileGuard:
                 "SPYRE_COMPILE_GUARD=warn to downgrade this to a log line."
             )
         if first_report:
+            shapes = _traced_frame_tensor_shapes()
             logger.warning(
-                "%s. This costs a full Inductor compile here; re-run with "
-                "TORCH_LOGS=recompiles to see which guard failed.",
+                "%s. Input tensor shapes: %s. "
+                "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
                 described,
+                shapes,
             )
 
     def _classify(self, code: CodeType | None) -> tuple[CompileKind, str]:
@@ -350,6 +352,48 @@ def _is_recompile(compile_id: str) -> bool:
         return int(body.rpartition("/")[2]) > 0
     except ValueError:
         return False
+
+
+def _traced_frame_tensor_shapes() -> str:
+    """Snapshot the tensor shapes in the frame Dynamo is about to trace.
+
+    Walks the call stack to find Dynamo's ``_compile`` frame (the same one
+    ``_traced_code`` targets), then reads the *traced frame*'s local variables and
+    collects every ``torch.Tensor`` argument with its shape.
+
+    Used by ``_on_compile_start`` so each unexpected-compile warning includes the
+    exact shapes that triggered the guard failure, without requiring a separate
+    ``TORCH_LOGS=recompiles`` re-run.
+
+    Returns a compact string like ``{x: [6, 4096], positions: [6]}``, or a short
+    diagnostic when the frame cannot be located (e.g. after a torch refactor).
+
+    Best-effort only: never raises.
+    """
+    import torch
+
+    try:
+        frame: Any = sys._getframe()
+        while frame is not None:
+            code = frame.f_code
+            if code.co_name == "_compile" and code.co_filename.replace("\\", "/").endswith(
+                "torch/_dynamo/convert_frame.py"
+            ):
+                # ``frame`` local inside _compile is the actual Python frame being
+                # traced (distinct from the _compile frame we are standing in).
+                traced_frame = frame.f_locals.get("frame")
+                if traced_frame is None:
+                    return "<_compile.frame is None>"
+                shapes = {
+                    name: list(val.shape)
+                    for name, val in traced_frame.f_locals.items()
+                    if isinstance(val, torch.Tensor)
+                }
+                return str(shapes) if shapes else "<no tensor locals in traced frame>"
+            frame = frame.f_back
+        return "<_compile frame not found in call stack>"
+    except Exception as exc:  # pragma: no cover
+        return f"<shape extraction failed: {exc}>"
 
 
 def _traced_code() -> CodeType | None:
