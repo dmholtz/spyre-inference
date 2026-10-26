@@ -385,16 +385,28 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
+                from vllm.v1.attention.backend import max_decode_query_len
+
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
                 # Decode packs one token per running sequence; prefill lands on
                 # the single largest bucket. Denser sizes only cost warmup time.
                 max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                sizes = {max_capture_size, num_seqs}
+                seq_ladder = {num_seqs}
                 size = 1
                 while size < num_seqs:
-                    sizes.add(size)
+                    seq_ladder.add(size)
                     size *= 2
+                sizes = {max_capture_size, *seq_ladder}
+                # Speculative decoding: a decode step packs up to 1 + k tokens per
+                # running sequence, so n sequences fill n..n*(1+k) rows. Without
+                # buckets in that range such a step pads up to the prefill bucket,
+                # running the whole body at 512 rows for a few dozen real ones.
+                # One bucket per sequence-ladder rung keeps the padding bounded by
+                # that rung's width. 1 (a no-op here) when speculation is off.
+                verify_len = max_decode_query_len(vllm_config)
+                if verify_len > 1:
+                    sizes |= {min(n * verify_len, max_capture_size) for n in seq_ladder}
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
