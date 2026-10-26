@@ -1295,12 +1295,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # shapes compile faster via partial cache hits.
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
-                _, last_hidden_states = self._dummy_run(size)
+                hidden_states, _ = self._dummy_run(size)
                 self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
-                    widest_hidden_states = last_hidden_states
+                    widest_hidden_states = hidden_states
             # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
+            # Slice the full body output, not ``_dummy_run``'s second return: that one is
+            # already gathered to one row per dummy request (at most ``max_num_reqs``), so
+            # slicing it would silently cap every width above ``max_num_reqs`` -- exactly
+            # the speculative widths -- and leave them uncompiled.
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
