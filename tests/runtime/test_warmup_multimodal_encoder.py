@@ -152,6 +152,7 @@ def test_generative_warmup_runs_a_compiled_tower_at_every_width():
         "generate", multimodal=True, max_items={"image": 3}, compiled_tower_blocks=2
     )
     runner.max_num_reqs = 4
+    runner.num_spec_tokens = 0
     runner._dummy_sampler_run = lambda hidden_states: None
     runner._record_attention_graphs = lambda: None
 

@@ -37,7 +37,7 @@ class _Bucketer:
         self.warmed_up = True
 
 
-def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
+def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS, num_spec_tokens=0):
     # NONE keeps warmup off the attention recorder, which this file does not
     # exercise and which needs a real KV cache.
     compilation_config = types.SimpleNamespace(
@@ -59,6 +59,7 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
     runner._spyre_device = torch.device("cpu")
     runner.spyre_shape_bucketer = _Bucketer(list(bucket_sizes))
     runner.max_num_reqs = max_num_reqs
+    runner.num_spec_tokens = num_spec_tokens
 
     body_rows: list[int] = []
     projected_rows: list[int] = []
@@ -104,6 +105,16 @@ def test_no_width_is_projected_twice():
     runner.warming_up_model()
 
     assert len(projected_rows) == len(set(projected_rows))
+
+
+def test_speculative_tokens_widen_the_projected_rows():
+    """Each request samples its drafts plus the bonus token, so k=3 projects 4 rows."""
+    runner, _, projected_rows = _runner(
+        bucket_sizes=[1, 512], max_num_reqs=1, num_spec_tokens=3
+    )
+    runner.warming_up_model()
+
+    assert sorted(projected_rows) == [1, 4]
 
 
 def test_a_max_num_reqs_below_every_bucket_still_warms_one_width():
