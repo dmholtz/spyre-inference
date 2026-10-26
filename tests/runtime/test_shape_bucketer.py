@@ -470,5 +470,16 @@ class TestLogitsRowBuckets:
     def test_keeps_a_non_power_of_two_max(self):
         assert logits_row_buckets([1, 2, 4, 6, 512], max_num_reqs=6) == [1, 2, 4, 6]
 
+    def test_speculative_tokens_widen_the_cap(self):
+        # k drafts + 1 bonus token per request.
+        assert logits_row_buckets([1, 512], max_num_reqs=1, num_spec_tokens=3) == [1, 4]
+        assert logits_row_buckets([1, 2, 4, 8, 512], max_num_reqs=8, num_spec_tokens=3) == [
+            1,
+            2,
+            4,
+            8,
+            32,
+        ]
+
     def test_ignores_non_positive_sizes(self):
         assert logits_row_buckets([0, -1, 4], max_num_reqs=8) == [4]

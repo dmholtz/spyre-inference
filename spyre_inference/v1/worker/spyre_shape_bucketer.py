@@ -508,9 +508,12 @@ def encoder_grid_source_rows(
     return rows
 
 
-def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
-    """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
-    cap = max(1, max_num_reqs)
+def logits_row_buckets(
+    bucket_sizes: Sequence[int], max_num_reqs: int, num_spec_tokens: int = 0
+) -> list[int]:
+    """Row widths the lm_head can see: each body bucket clipped to the most rows a step
+    samples, ``max_num_reqs * (1 + num_spec_tokens)`` (every draft plus the bonus token)."""
+    cap = max(1, max_num_reqs) * (1 + max(0, num_spec_tokens))
     return sorted({min(size, cap) for size in bucket_sizes if size > 0})
 
 

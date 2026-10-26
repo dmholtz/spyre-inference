@@ -89,6 +89,17 @@ def test_every_reachable_width_lands_on_a_warmed_shape():
     assert set(model.seen_rows) <= set(buckets)
 
 
+def test_every_speculative_row_count_lands_on_a_warmed_shape():
+    """max_num_seqs=1, k=3: a step samples 1..4 rows, none may reach the head unwarmed."""
+    buckets = logits_row_buckets([1, 512], max_num_reqs=1, num_spec_tokens=3)
+    model, wrapper = _wrapper(buckets)
+
+    for rows in range(1, 5):
+        wrapper.compute_logits(torch.randn(rows, HIDDEN, dtype=torch.float16))
+
+    assert set(model.seen_rows) <= set(buckets)
+
+
 def test_no_buckets_keeps_the_old_behaviour():
     model, wrapper = _wrapper([])
     wrapper.compute_logits(torch.randn(5, HIDDEN, dtype=torch.float16))

@@ -877,7 +877,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logits_row_buckets=(
                 []
                 if bucketer is None
-                else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
+                else logits_row_buckets(
+                    bucketer.bucket_sizes, self.max_num_reqs, self.num_spec_tokens
+                )
             ),
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
@@ -1098,7 +1100,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             bucket_sizes[0] if bucket_sizes else 0,
             bucket_sizes[-1] if bucket_sizes else 0,
         )
-        row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs)
+        row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs, self.num_spec_tokens)
         t0 = time.time()
         with _set_spyre_compilation_settings(self.vllm_config):
             # Compile largest bucket first: Inductor's internal caches benefit
