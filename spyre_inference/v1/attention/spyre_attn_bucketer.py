@@ -40,6 +40,7 @@ from dataclasses import dataclass
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import max_decode_query_len
 
 from spyre_inference import envs
 from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
@@ -275,14 +276,19 @@ class SpyreAttnBucketer:
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
-        # build()) then multiples of a step up to max_num_batched_tokens, the
-        # query lengths a prefill pads up to.
+        # build()), the speculative verification width, then multiples of a step up
+        # to max_num_batched_tokens, the query lengths a prefill pads up to.
+        # Verification queries are 2..1+k tokens wide. Without their own bucket they
+        # would round up onto the prefill step and run a prefill-width kernel (and
+        # build a prefill-width mask) per sequence for a handful of real rows.
+        # 1 when speculative decoding is off, which leaves the ladder unchanged.
+        verify_len = min(max_decode_query_len(vllm_config), max_batched)
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
         self._query_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_QUERY_BUCKETS,
             max_batched,
             "SPYRE_ATTN_QUERY_BUCKETS",
-            lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
+            lambda: sorted({1, verify_len, *range(step, max_batched + 1, step), max_batched}),
         )
 
         # Default: the SPYRE_ATTN_KV_LADDER preset. Sparse because the recorded set is a
