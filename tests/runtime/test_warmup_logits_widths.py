@@ -65,8 +65,13 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS, num_spec_token
     projected_rows: list[int] = []
 
     def dummy_run(size, *args, **kwargs):
+        # Like upstream: the full body output, then one gathered row per dummy request
+        # (at most max_num_reqs).
         body_rows.append(size)
-        return None, torch.zeros(size, HIDDEN, dtype=torch.float16)
+        return (
+            torch.zeros(size, HIDDEN, dtype=torch.float16),
+            torch.zeros(min(size, max_num_reqs), HIDDEN, dtype=torch.float16),
+        )
 
     def dummy_sampler_run(hidden_states):
         projected_rows.append(hidden_states.shape[0])

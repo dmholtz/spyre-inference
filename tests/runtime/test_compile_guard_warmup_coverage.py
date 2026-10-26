@@ -230,8 +230,8 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         )
 
         def base_dummy_run(_self, size, *args, **kwargs):
-            hidden = torch.zeros(size, HIDDEN)
-            return None, block(hidden)
+            hidden = block(torch.zeros(size, HIDDEN))
+            return hidden, hidden[: min(size, MAX_NUM_REQS)]
 
         runner._dummy_sampler_run = lambda hidden_states: torch.tensor([])
         runner._dummy_pooler_run = lambda hidden_states: None
