@@ -1661,7 +1661,7 @@ def test_head_major_warmup_records_a_batched_decode_variant(
 
     realized = impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
-    assert realized == (num_seqs, blocks_per_chunk, num_chunks)
+    assert realized == (num_seqs, blocks_per_chunk, num_chunks, 1)
     assert batched_decode_calls, "the recorder traced the per-seq loop, not the batched kernel"
 
     del kv_cache

@@ -177,6 +177,14 @@ the per-sequence loop), warmup records eligible KV-length × num-sequences combi
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+With speculative decoding the batched kernel also serves verification steps, which carry up
+to `1 + num_speculative_tokens` query tokens per sequence. Warmup then records each
+KV-length × num-sequences combination a second time at that query width (skipping the ones
+whose query gather would not fit in `--max-num-batched-tokens`), so expect roughly twice the
+batched-decode compiles. A step whose widest sequence has no recorded width, for instance
+because `SPYRE_ATTN_QUERY_BUCKETS` omits the verification width, runs the per-sequence loop
+instead. Without speculative decoding nothing changes.
+
 ## FP8 KV cache
 
 Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes

@@ -675,7 +675,7 @@ class TestRecordBatchedDecode:
 
         bucketer = builder._attn_bucketer = make_bucketer()
         keys = {
-            (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
+            (v.num_seqs, v.blocks_per_chunk, v.num_chunks, v.query_width)
             for v in bucketer.batched_decode_variants()
         }
 
@@ -695,5 +695,6 @@ class TestRecordBatchedDecode:
                     metadata.padded_num_seqs,
                     metadata.blocks_per_chunk,
                     metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
+                    metadata.decode_query_width,
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"

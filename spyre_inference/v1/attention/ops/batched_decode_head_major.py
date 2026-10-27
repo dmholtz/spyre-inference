@@ -100,6 +100,8 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
     v_scale=None,
+    query_width=1,
+    out_row_ids=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -116,9 +118,20 @@ def batched_decode_head_major_kernel(
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``.
+
+    ``query_width`` W is the number of query rows per sequence (1 for a plain decode, up
+    to 1 + num_speculative_tokens for a verification step). The query-group axis G of
+    every score tensor becomes the fused axis G * W, ordered (G, W); rep_row_ids is
+    [entries * W] in (block slot, sequence, row) order and the mask carries the fused axis
+    in full. The result is [num_seqs * W, num_heads, head_size] in (sequence, row) order,
+    stored with ``out.index_copy_(0, out_row_ids, ...)``. At W == 1 the mask's axis stays a
+    broadcast 1 and the result is a contiguous prefix store, exactly as before.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    # Query rows the score matmuls see per (entry, KV head): the query group, times the
+    # query width. Equals num_queries_per_kv at width 1, so that path is unchanged.
+    group_rows = num_queries_per_kv * query_width
     # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
     split_index = USE_FOR_EACH_TILE
     num_chunks = (
@@ -126,18 +139,24 @@ def batched_decode_head_major_kernel(
     )
     # With one chunk there is no repeated cross-slot merge to defer.
     use_entry_local = num_chunks > 1
-    q = query.index_select(0, rep_row_ids).reshape(
-        entries, num_kv_heads, num_queries_per_kv, head_size
-    )
+    q_rows = query.index_select(0, rep_row_ids)
+    if query_width == 1:
+        q = q_rows.reshape(entries, num_kv_heads, num_queries_per_kv, head_size)
+    else:
+        q = (
+            q_rows.reshape(entries, query_width, num_kv_heads, num_queries_per_kv, head_size)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(entries, num_kv_heads, group_rows, head_size)
+        )
 
     def reduce_chunk(probs, v_page):
         """Sum the chunk's blocks; its slots share one max, so this needs no rescale."""
         chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
         chunk_out = torch.sum(
             torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                probs.reshape(entries, num_kv_heads, group_rows, block_size),
                 v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, group_rows, head_size),
             dim=0,
             keepdim=True,
         )
@@ -164,9 +183,7 @@ def batched_decode_head_major_kernel(
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # Leading-axis split only: torch-spyre rejects merging a permuted axis pair, and
         # the mask's advancing read window must stay unflattened.
-        sc = scores.reshape(
-            blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
-        )
+        sc = scores.reshape(blocks_per_chunk, num_seqs, num_kv_heads, group_rows, block_size)
         sc = sc + mask_rows
         if use_entry_local:
             return (
@@ -178,7 +195,7 @@ def batched_decode_head_major_kernel(
                     blocks_per_chunk,
                     num_seqs,
                     num_kv_heads,
-                    num_queries_per_kv,
+                    group_rows,
                     block_size,
                     head_size,
                 ),
@@ -206,9 +223,9 @@ def batched_decode_head_major_kernel(
         ), None
 
     slots = (
-        (blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv)
+        (blocks_per_chunk, num_seqs, num_kv_heads, group_rows)
         if use_entry_local
-        else (1, num_seqs, num_kv_heads, num_queries_per_kv)
+        else (1, num_seqs, num_kv_heads, group_rows)
     )
     state_shape = (*slots, 1)
     out_shape = (*slots, head_size)
@@ -227,16 +244,29 @@ def batched_decode_head_major_kernel(
     if use_entry_local:
         tile_max, tile_sum, tile_output = carry
         attn = _merge_entry_local(
-            tile_max, tile_sum, tile_output, num_seqs, num_kv_heads, num_queries_per_kv, head_size
+            tile_max, tile_sum, tile_output, num_seqs, num_kv_heads, group_rows, head_size
         )
     else:
         _, tile_sum, tile_output = carry
-        attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+        attn = (tile_output / tile_sum).reshape(num_seqs, num_kv_heads * group_rows, head_size)
+    if query_width > 1:
+        # (G, W) back to (W, G) and heads: rows land in (sequence, row) order.
+        attn = (
+            attn.reshape(num_seqs, num_kv_heads, num_queries_per_kv, query_width, head_size)
+            .permute(0, 3, 1, 2, 4)
+            .reshape(num_seqs * query_width, num_heads, head_size)
+        )
     if v_scale is not None and v_scale != 1.0:
         attn = attn * v_scale
     if out is not None:
-        # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
-        # don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
+        if query_width == 1:
+            # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
+            # don't-care and kept finite by the builder.
+            out[:num_seqs].copy_(attn)
+        else:
+            # Rows of a sequence past its real query_len repeat its last real row and
+            # padded sequences go to a scratch row, so index_copy_'s undefined order for
+            # duplicate indices only ever races identical values.
+            out.index_copy_(0, out_row_ids, attn)
         return out
     return attn

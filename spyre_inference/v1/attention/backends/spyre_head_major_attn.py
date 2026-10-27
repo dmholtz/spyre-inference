@@ -292,6 +292,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             device, device_layout=temporary_chunk_major_page_index_layout(c, e)
         )
         attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        if attn_metadata.out_row_ids_cpu is not None:
+            attn_metadata.out_row_ids_dev = convert(attn_metadata.out_row_ids_cpu, device=device)
         attn_metadata.mask_by_chunk_dev = convert(
             attn_metadata.mask_by_chunk_cpu.reshape(
                 c, bpc, b, *attn_metadata.mask_by_chunk_cpu.shape[2:]
@@ -311,8 +313,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        query_width: int = 1,
+        out_row_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale, v_args = self._read_scales()
+        # v_scale is positional-or-keyword ahead of the width arguments; a model-dtype
+        # cache passes None, which the kernel treats as no scaling.
+        v_scale = v_args[0] if v_args else None
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
             return self._decode_fn(
                 query_dev,
@@ -330,7 +337,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.head_size,
                 self.logits_soft_cap,
                 out,
-                *v_args,
+                v_scale,
+                query_width=query_width,
+                out_row_ids=out_row_ids,
             )
 
     def _run_page_attn(

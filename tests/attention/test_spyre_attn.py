@@ -2162,6 +2162,164 @@ def test_batched_decode_matches_fp32_reference(
     torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
 
 
+def _verification_batch(
+    query_lens: list[int],
+    b_seqs: int,
+    num_blocks: int,
+    bpc: int,
+    num_kv_heads: int,
+    qpk: int,
+    width: int,
+    block_size: int = 16,
+    head_size: int = 8,
+):
+    """A multi-row decode batch laid out the way ``build()`` hands it to the kernel.
+
+    Every sequence ends mid-block; sequence ``s`` has ``query_lens[s]`` trailing query
+    tokens, each attending causally. Returns the kernel's inputs and, per token, the
+    reference attention output.
+    """
+    num_seqs = len(query_lens)
+    num_heads = num_kv_heads * qpk
+    padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
+    scale = 0.5
+    num_tokens = sum(query_lens)
+    starts = [sum(query_lens[:s]) for s in range(num_seqs)]
+
+    n_pages = padded_blocks * b_seqs + 1
+    # One spare row past the tokens: where padded sequences store.
+    query = torch.randn(num_tokens + 1, num_heads * head_size, dtype=torch.float32)
+    k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+    v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+
+    page_ids = torch.zeros(b_seqs, padded_blocks, dtype=torch.int64)
+    mask = torch.full(
+        (b_seqs, padded_blocks, width, block_size),
+        torch.finfo(torch.float32).min,
+        dtype=torch.float32,
+    )
+    kv_lens = []
+    for s in range(num_seqs):
+        n_use = max(1, num_blocks - s)
+        kv_len = (n_use - 1) * block_size + block_size // 2 + s
+        kv_lens.append(kv_len)
+        for b in range(n_use):
+            page_ids[s, b] = 1 + s * padded_blocks + b
+        for r in range(width):
+            # Rows past query_len repeat the last real row, as the builder's clamp does.
+            row = min(r, query_lens[s] - 1)
+            visible = kv_len - query_lens[s] + row + 1
+            for b in range(n_use):
+                valid = max(0, min(block_size, visible - b * block_size))
+                mask[s, b, r, :valid] = 0.0
+    mask[num_seqs:, 0] = 0.0  # padded rows keep one finite block, as the builder does
+
+    gather = torch.zeros(b_seqs, width, dtype=torch.int64)
+    store = torch.full((b_seqs, width), num_tokens, dtype=torch.int64)
+    for s in range(num_seqs):
+        rows = torch.tensor([starts[s] + min(r, query_lens[s] - 1) for r in range(width)])
+        gather[s] = rows
+        store[s] = rows
+
+    mask_by_chunk = (
+        mask.transpose(0, 1)
+        .unsqueeze(2)
+        .unsqueeze(3)
+        .expand(padded_blocks, b_seqs, num_kv_heads, qpk, width, block_size)
+        .reshape(padded_blocks, b_seqs, num_kv_heads, qpk * width, block_size)
+        .contiguous()
+    )
+
+    expected = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float32)
+    for s in range(num_seqs):
+        n_use = max(1, num_blocks - s)
+        k = torch.cat([k_pages[page_ids[s, b]] for b in range(n_use)], dim=0)
+        v = torch.cat([v_pages[page_ids[s, b]] for b in range(n_use)], dim=0)
+        for i in range(query_lens[s]):
+            visible = kv_lens[s] - query_lens[s] + i + 1
+            q = query[starts[s] + i].reshape(num_kv_heads, qpk, head_size)
+            scores = torch.einsum("hqd,thd->hqt", q, k) * scale
+            scores[..., visible:] = float("-inf")
+            probs = torch.softmax(scores, dim=-1)
+            expected[starts[s] + i] = torch.einsum("hqt,thd->hqd", probs, v).reshape(
+                num_heads, head_size
+            )
+
+    return {
+        "query": query,
+        "rep_row_ids": gather.reshape(-1).repeat(bpc),
+        "k_pages": k_pages,
+        "v_pages": v_pages,
+        "chunk_page_ids": page_ids.t().contiguous(),
+        "mask_by_chunk": mask_by_chunk,
+        "out_row_ids": store.reshape(-1),
+        "scale": scale,
+        "block_size": block_size,
+        "head_size": head_size,
+        "num_heads": num_heads,
+        "num_tokens": num_tokens,
+    }, expected
+
+
+@pytest.mark.parametrize(
+    "query_lens,b_seqs,num_blocks,bpc,num_kv_heads,qpk,width",
+    [
+        pytest.param([4, 4, 4], 4, 6, 3, 2, 1, 4, id="uniform_padded_seq_bucket"),
+        pytest.param([4, 1, 3, 2, 4], 8, 6, 2, 2, 2, 4, id="ragged_gqa"),
+        pytest.param([2, 2], 2, 5, 5, 1, 4, 2, id="one_chunk_gqa"),
+        pytest.param([3, 4, 1, 4], 4, 6, 1, 2, 1, 4, id="bpc_1_ragged"),
+        pytest.param([1, 1, 1], 4, 6, 3, 2, 2, 2, id="width_above_every_query_len"),
+    ],
+)
+def test_batched_decode_query_width_matches_per_row_reference(
+    query_lens: list[int],
+    b_seqs: int,
+    num_blocks: int,
+    bpc: int,
+    num_kv_heads: int,
+    qpk: int,
+    width: int,
+) -> None:
+    """Rows of a verification step each equal a direct causal softmax over their prefix.
+
+    Covers the fused (query group, row) axis, the (G, W) to (W, G) un-permute, the
+    per-row mask, padded rows repeating the last real row, and padded sequences storing
+    to the scratch row instead of racing a real one.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    args, expected = _verification_batch(
+        query_lens, b_seqs, num_blocks, bpc, num_kv_heads, qpk, width
+    )
+    out = torch.zeros(
+        args["num_tokens"] + 1, args["num_heads"], args["head_size"], dtype=torch.float32
+    )
+    batched_decode_kernel(
+        args["query"],
+        args["rep_row_ids"],
+        args["k_pages"],
+        args["v_pages"],
+        args["chunk_page_ids"],
+        args["mask_by_chunk"],
+        args["scale"],
+        b_seqs,
+        bpc,
+        num_kv_heads,
+        qpk,
+        args["block_size"],
+        args["head_size"],
+        0.0,
+        out,
+        query_width=width,
+        out_row_ids=args["out_row_ids"],
+    )
+
+    n = args["num_tokens"]
+    assert torch.isfinite(out[:n]).all()
+    torch.testing.assert_close(out[:n], expected, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     "num_blocks,padded_query_len,num_kv_heads,qpk,use_alibi",
     [

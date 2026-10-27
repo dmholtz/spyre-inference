@@ -84,16 +84,20 @@ class SpyreAttnBucket:
 class SpyreAttnBatchedDecodeBucket:
     """One recordable batched decode kernel variant.
 
-    The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
-    ``num_chunks`` (derived from the logical block-axis tensor extent).
+    The kernel specializes on ``num_seqs``, ``blocks_per_chunk``, ``num_chunks``
+    (derived from the logical block-axis tensor extent) and ``query_width``.
     ``num_blocks`` is the bucket they were derived from, kept so the recorder can
     skip a bucket that outruns the KV allocation.
+
+    ``query_width`` is the padded number of query rows per sequence: 1 for a plain
+    decode step, up to ``1 + num_speculative_tokens`` for a verification step.
     """
 
     num_seqs: int
     num_blocks: int
     blocks_per_chunk: int
     num_chunks: int
+    query_width: int = 1
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -234,6 +238,28 @@ class SpyreAttnBucketer:
             lambda: sorted({1, verify_len, *range(step, max_batched + 1, step), max_batched}),
         )
 
+        # The query widths a batched decode step can take: the query buckets a
+        # verification request (up to 1 + num_speculative_tokens tokens) rounds onto.
+        # [1] without speculative decoding, which leaves the batched grid unchanged.
+        self._max_batched_tokens: int = max_batched
+        self._max_decode_query_len: int = max_decode_query_len(vllm_config)
+        # Width 1 is always present: a plain decode step needs it even when an override
+        # of the query buckets leaves out the decode bucket.
+        self._decode_query_buckets: list[int] = sorted(
+            {1, *(b for b in self._query_buckets if b <= self._max_decode_query_len)}
+        )
+        if (
+            self._max_decode_query_len > 1
+            and self._decode_query_buckets[-1] < self._max_decode_query_len
+        ):
+            # An override that skips the verification width: the covering bucket is
+            # wider than a decode, so the step stays on the per-sequence loop.
+            logger.warning(
+                "SPYRE_ATTN_QUERY_BUCKETS has no bucket for the speculative verification "
+                "width %d; verification steps will not use the batched decode kernel.",
+                self._max_decode_query_len,
+            )
+
         # Default: powers of two from block_size up to max_model_len. Geometric
         # because the recorded set is a product of both axes; the extra padding
         # each bucket costs is absorbed by the mask.
@@ -285,6 +311,10 @@ class SpyreAttnBucketer:
     def num_seqs_buckets(self) -> list[int]:
         return self._num_seqs_buckets
 
+    @property
+    def decode_query_buckets(self) -> list[int]:
+        return self._decode_query_buckets
+
     def find_kv_bucket(self, kv_len: int) -> int | None:
         return self._round_up(kv_len, self._kv_buckets)
 
@@ -293,6 +323,26 @@ class SpyreAttnBucketer:
 
     def find_sequence_bucket(self, num_seqs: int) -> int | None:
         return self._round_up(num_seqs, self._num_seqs_buckets)
+
+    def decode_width_fits(self, num_seqs: int, blocks_per_chunk: int, query_width: int) -> bool:
+        """Whether a batched decode step of this shape can use ``query_width`` rows.
+
+        The kernel gathers ``num_seqs * blocks_per_chunk * query_width`` query rows from
+        the staging buffer, which holds ``max_num_batched_tokens + 1`` rows, and a gather
+        selecting its whole source faults the device (torch-spyre#4033). Width 1 is the
+        long-standing path and is never declined here.
+        """
+        if query_width == 1:
+            return True
+        return num_seqs * blocks_per_chunk * query_width <= self._max_batched_tokens
+
+    def find_decode_query_bucket(self, query_len: int) -> int | None:
+        """Batched decode's padded query width for ``query_len``; None when none covers it.
+
+        Narrower than ``find_query_bucket``: only widths ``batched_decode_variants``
+        records are answers, so a None sends the step to the per-sequence loop.
+        """
+        return self._round_up(query_len, self._decode_query_buckets)
 
     def find_blocks_bucket(self, num_blocks: int) -> int | None:
         return self._round_up(num_blocks, self._num_blocks_buckets)
@@ -334,10 +384,11 @@ class SpyreAttnBucketer:
     def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
-        The full ``num_seqs_buckets x num_blocks_buckets`` grid: unlike
-        ``variants()`` there is no inter-axis bound to exploit, since a decode
-        batch of any size can sit at any context length. Both axes are geometric,
-        so the grid stays small.
+        The full ``num_seqs_buckets x num_blocks_buckets`` grid, once per decode
+        query width: unlike ``variants()`` there is no inter-axis bound to exploit,
+        since a decode batch of any size can sit at any context length. All axes
+        are geometric or short, so the grid stays small. Without speculative
+        decoding the only width is 1.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
@@ -345,12 +396,18 @@ class SpyreAttnBucketer:
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
             for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
                 blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-                out.append(
-                    SpyreAttnBatchedDecodeBucket(
-                        num_seqs=num_seqs,
-                        num_blocks=num_blocks,
-                        blocks_per_chunk=blocks_per_chunk,
-                        num_chunks=num_chunks,
+                for query_width in sorted(self._decode_query_buckets, reverse=True):
+                    # build() declines what does not fit, so recording it would trace a
+                    # kernel dispatch cannot reach.
+                    if not self.decode_width_fits(num_seqs, blocks_per_chunk, query_width):
+                        continue
+                    out.append(
+                        SpyreAttnBatchedDecodeBucket(
+                            num_seqs=num_seqs,
+                            num_blocks=num_blocks,
+                            blocks_per_chunk=blocks_per_chunk,
+                            num_chunks=num_chunks,
+                            query_width=query_width,
+                        )
                     )
-                )
         return out

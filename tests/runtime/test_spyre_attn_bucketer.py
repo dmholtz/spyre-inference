@@ -535,6 +535,76 @@ class TestBatchedDecodeVariants:
         b = SpyreAttnBucketer(make_config(32768, 2048, max_num_seqs=64))
         assert len(b.batched_decode_variants()) < 100
 
+    def test_without_speculation_every_variant_is_one_row_wide(self, enabled):
+        assert enabled.decode_query_buckets == [1]
+        assert {v.query_width for v in enabled.batched_decode_variants()} == {1}
+
+
+class TestBatchedDecodeQueryWidth:
+    """Speculative decoding adds a verification width to the batched decode grid."""
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+
+    def test_verification_width_joins_the_decode_buckets(self):
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.decode_query_buckets == [1, 4]
+
+    def test_each_width_gets_the_full_grid_where_it_fits(self):
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        variants = b.batched_decode_variants()
+        assert {v.query_width for v in variants} == {1, 4}
+        width_one = {(v.num_seqs, v.num_blocks) for v in variants if v.query_width == 1}
+        width_four = {(v.num_seqs, v.num_blocks) for v in variants if v.query_width == 4}
+        assert width_one == {(s, n) for n in b.num_blocks_buckets for s in b.num_seqs_buckets}
+        assert width_four <= width_one
+
+    def test_width_one_variants_match_the_unspeculated_grid(self):
+        plain = SpyreAttnBucketer(make_config()).batched_decode_variants()
+        speculative = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert [v for v in speculative.batched_decode_variants() if v.query_width == 1] == plain
+
+    def test_no_duplicates(self):
+        bucketer = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        variants = bucketer.batched_decode_variants()
+        assert len(set(variants)) == len(variants)
+
+    def test_a_width_that_gathers_past_the_query_buffer_is_not_recorded(self):
+        # 8 seqs * 4 blocks_per_chunk * 4 rows = 128 > 64 tokens.
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=64, num_speculative_tokens=3))
+        assert not b.decode_width_fits(8, 4, 4)
+        assert b.decode_width_fits(8, 4, 1)
+        assert all(
+            b.decode_width_fits(v.num_seqs, v.blocks_per_chunk, v.query_width)
+            for v in b.batched_decode_variants()
+        )
+
+    def test_find_decode_query_bucket_rounds_up_to_a_recorded_width(self):
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.find_decode_query_bucket(1) == 1
+        assert b.find_decode_query_bucket(2) == 4
+        assert b.find_decode_query_bucket(4) == 4
+
+    def test_find_decode_query_bucket_declines_past_the_verification_width(self):
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.find_decode_query_bucket(5) is None
+
+    def test_an_override_without_the_verification_width_declines_it(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,512")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.decode_query_buckets == [1]
+        assert b.find_decode_query_bucket(4) is None
+        assert b.find_decode_query_bucket(1) == 1
+
+    def test_disabled_path_records_nothing(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+        envs.clear_env_cache()
+        bucketer = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert bucketer.batched_decode_variants() == []
+
 
 class TestSingleKvHeadBlockFloor:
     """A lone KV head on a lone page will not compile under the head-major layout, so
