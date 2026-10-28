@@ -106,6 +106,11 @@ def batched_decode_kernel(
             blocks_per_chunk, num_seqs, num_kv_heads, q_total, block_size
         )
         sc = sc + mask_rows
+        # Clamp away -inf before the running max: a padding query-token slot (its
+        # mask row is all -inf) would give exp(-inf - -inf) = NaN in the reduction.
+        # finfo.min is small enough that exp(finfo.min - finite_max) ≈ 0, so the
+        # padded slot contributes nothing to the output. Matches the head-major kernel.
+        sc = torch.clamp(sc, min=torch.finfo(sc.dtype).min)
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
 
         # The running max drives exp(), not the chunk's own: a chunk wholly past

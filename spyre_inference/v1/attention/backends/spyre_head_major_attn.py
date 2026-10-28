@@ -319,6 +319,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         verify_len: int = 1,
     ) -> torch.Tensor:
         scale, v_args = self._read_scales()
+        # v_args expands to (v_scale,) for fp8 caches or () otherwise; the kernel
+        # signature has v_scale between out and verify_len, so verify_len must be
+        # passed as a keyword to avoid landing in the v_scale slot when v_args=().
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
             return self._decode_fn(
                 query_dev,
@@ -337,7 +340,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
-                verify_len,
+                verify_len=verify_len,
             )
 
     def _run_page_attn(

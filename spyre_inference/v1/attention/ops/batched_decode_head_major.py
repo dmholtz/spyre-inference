@@ -184,6 +184,16 @@ def batched_decode_head_major_kernel(
         sc = scores.reshape(
             blocks_per_chunk, num_seqs, num_kv_heads, q_total, block_size
         )
+        # mask_rows has shape [..., verify_len, block_size]; sc has [..., q_total, block_size]
+        # where q_total = num_queries_per_kv * verify_len. Each token slot t applies to all
+        # num_queries_per_kv query heads for that token (qt = t * num_queries_per_kv + qh),
+        # so expand verify_len → q_total by repeating each slot num_queries_per_kv times.
+        # For verify_len == 1 this is a no-op (q_total == num_queries_per_kv, shape is
+        # already broadcast-compatible).
+        if verify_len > 1:
+            mask_rows = mask_rows.unsqueeze(-2).expand(
+                *mask_rows.shape[:-1], num_queries_per_kv, block_size
+            ).reshape(*mask_rows.shape[:-2], q_total, block_size)
         sc = sc + mask_rows
         if use_entry_local:
             return (

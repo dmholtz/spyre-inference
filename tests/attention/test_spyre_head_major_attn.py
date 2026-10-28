@@ -1665,8 +1665,340 @@ def test_head_major_warmup_records_a_batched_decode_variant(
 
     realized = impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
-    assert realized == (num_seqs, blocks_per_chunk, num_chunks)
+    assert realized == (num_seqs, blocks_per_chunk, num_chunks, 1)  # verify_len=1 (no spec config)
     assert batched_decode_calls, "the recorder traced the per-seq loop, not the batched kernel"
 
     del kv_cache
     gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Non-uniform spec-decode verify_len tests for the head-major backend.
+# Mirrors the token-major suite: checks builder metadata fields and kernel
+# correctness when some decode seqs have query_len < verify_len.
+# ---------------------------------------------------------------------------
+
+
+def _build_spec_decode_metadata_head_major(
+    verify_seqs,
+    plain_decode_seqs,
+    block_size,
+    num_query_heads,
+    num_kv_heads,
+    head_size,
+):
+    """Head-major variant of _build_spec_decode_metadata from test_spyre_attn.py."""
+    from unittest.mock import Mock
+
+    from vllm.config import get_current_vllm_config
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        SpyreAttentionMetadataBuilder,
+    )
+
+    all_seqs = verify_seqs + plain_decode_seqs
+    query_lens = [q for q, _ in all_seqs]
+    kv_lens = [k for _, k in all_seqs]
+    num_seqs = len(all_seqs)
+    dtype = DTYPE
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+    vllm_config.cache_config.block_size = block_size
+
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["layers.0.self_attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+
+    buckets = SpyreAttnBucketer(vllm_config).num_blocks_buckets
+    max_num_blocks_per_seq = max((k + block_size - 1) // block_size for k in kv_lens)
+    padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
+    if padded_width is not None:
+        max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
+    block_table = torch.randint(0, 256, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32)
+
+    cu_query = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+    slot_mapping = torch.zeros(sum(query_lens), dtype=torch.int64)
+    is_prefilling = torch.zeros(num_seqs, dtype=torch.bool)
+
+    common = CommonAttentionMetadata(
+        query_start_loc=cu_query,
+        query_start_loc_cpu=cu_query,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        num_reqs=num_seqs,
+        num_actual_tokens=int(cu_query[-1].item()),
+        max_query_len=max(query_lens),
+        max_seq_len=max(kv_lens),
+        block_table_tensor=block_table,
+        slot_mapping=slot_mapping,
+        causal=True,
+        is_prefilling=is_prefilling,
+    )
+    return builder.build(common_prefix_len=0, common_attn_metadata=common), block_table
+
+
+@pytest.mark.parametrize(
+    "verify_seqs,plain_decode_seqs",
+    [
+        pytest.param(
+            [(3, 256), (3, 512), (3, 128), (3, 384)],
+            [],
+            id="uniform_verify(N=4,vl=3)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 512), (3, 384)],
+            [(1, 128)],
+            id="nonuniform_verify3_plain1(N=4)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 384)],
+            [(1, 512), (1, 128)],
+            id="nonuniform_verify3_plain2(N=4)",
+        ),
+        pytest.param(
+            [(3, 256)],
+            [(1, 512), (1, 128), (1, 384)],
+            id="nonuniform_verify3_plain3(N=4)",
+        ),
+    ],
+)
+def test_head_major_spec_decode_nonuniform_builder_metadata(
+    default_vllm_config, monkeypatch, verify_seqs, plain_decode_seqs
+):
+    """Builder produces valid metadata (head-major) for mixed spec-verify + plain-decode batches."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    from unittest.mock import MagicMock
+
+    from vllm.config import get_current_vllm_config
+
+    vllm_config_mock = get_current_vllm_config()
+    spec_cfg = MagicMock()
+    spec_cfg.num_speculative_tokens = 2
+    spec_cfg.parallel_drafting = False
+    vllm_config_mock.speculative_config = spec_cfg
+
+    torch.set_default_device("cpu")
+    block_size = 64
+    num_query_heads, num_kv_heads, head_size = 8, 2, 64
+
+    md, _ = _build_spec_decode_metadata_head_major(
+        verify_seqs=verify_seqs,
+        plain_decode_seqs=plain_decode_seqs,
+        block_size=block_size,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+    )
+
+    num_decode_seqs = len(verify_seqs) + len(plain_decode_seqs)
+    expected_verify_len = max(q for q, _ in verify_seqs) if verify_seqs else 1
+
+    assert md.padded_num_seqs is not None, "batched path declined this batch"
+    assert md.mask_by_chunk_cpu is not None
+    assert md.rep_row_ids_cpu is not None
+    assert md.decode_query_lens_cpu is not None
+
+    verify_len = md.mask_by_chunk_cpu.shape[-2]
+    assert verify_len == expected_verify_len
+    assert md.decode_query_lens_cpu.shape[0] == num_decode_seqs
+
+    total_tokens = int(md.num_decode_tokens)
+    assert md.rep_row_ids_cpu.max().item() < total_tokens
+
+    mask_min = torch.finfo(DTYPE).min
+    mask_seq_major = md.mask_by_chunk_cpu.permute(1, 0, 2, 3, 4)
+    all_decode_seqs = verify_seqs + plain_decode_seqs
+    for s, (q_len, _) in enumerate(all_decode_seqs):
+        assert (mask_seq_major[s, 0, 0, 0] > mask_min).any(), (
+            f"seq {s} real row 0 is fully masked"
+        )
+        for t in range(q_len, verify_len):
+            assert torch.all(mask_seq_major[s, 0, 0, t] <= mask_min), (
+                f"seq {s} padding row {t} not fully masked"
+            )
+
+    vllm_config_mock.speculative_config = None
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("cpu", id="device_cpu")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "verify_seqs,plain_decode_seqs",
+    [
+        pytest.param(
+            [(3, 256), (3, 512), (3, 128), (3, 384)],
+            [],
+            id="uniform_verify(N=4,vl=3)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 512), (3, 384)],
+            [(1, 128)],
+            id="nonuniform_verify3_plain1(N=4)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 384)],
+            [(1, 512), (1, 128)],
+            id="nonuniform_verify3_plain2(N=4)",
+        ),
+        pytest.param(
+            [(3, 256)],
+            [(1, 512), (1, 128), (1, 384)],
+            id="nonuniform_verify3_plain3(N=4)",
+        ),
+    ],
+)
+def test_head_major_spec_decode_nonuniform_dispatch_correctness(
+    default_vllm_config,
+    monkeypatch,
+    verify_seqs,
+    plain_decode_seqs,
+    configure_compilation,
+    configure_device,
+):
+    """Head-major batched kernel output matches per-seq reference for non-uniform verify_len."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    from unittest.mock import MagicMock
+
+    from spyre_testing_plugin.attn_helpers import assert_close_outliers, ref_attn
+    from vllm.config import get_current_vllm_config
+    from vllm.utils.torch_utils import set_random_seed
+
+    from spyre_inference.custom_ops.utils import convert
+
+    vllm_config_mock = get_current_vllm_config()
+    spec_cfg = MagicMock()
+    spec_cfg.num_speculative_tokens = 2
+    spec_cfg.parallel_drafting = False
+    vllm_config_mock.speculative_config = spec_cfg
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    block_size = 64
+    num_query_heads, num_kv_heads, head_size = 8, 2, 64
+    scale = head_size**-0.5
+
+    all_seqs = verify_seqs + plain_decode_seqs
+    query_lens = [q for q, _ in all_seqs]
+    kv_lens = [k for _, k in all_seqs]
+    num_seqs = len(all_seqs)
+    dtype = DTYPE
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+
+    num_blocks = 256
+    cache_device = torch.device(configure_device)
+
+    attn_impl = SpyreHeadMajorAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+    )
+
+    k_pages, v_pages = _fresh_pages(num_blocks, num_kv_heads, block_size, head_size, cache_device)
+    kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+
+    attn_metadata, block_tables = _build_spec_decode_metadata_head_major(
+        verify_seqs=verify_seqs,
+        plain_decode_seqs=plain_decode_seqs,
+        block_size=block_size,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+    )
+
+    # Populate the cache using the impl's writer so the head-major layout is correct
+    slot_mapping_list: list[int] = []
+    q_offset = 0
+    hist_k, hist_v, hist_slots = [], [], []
+    k_expected = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
+    v_expected = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
+    for seq_idx in range(num_seqs):
+        q_len = query_lens[seq_idx]
+        kv_len = kv_lens[seq_idx]
+        historical_len = kv_len - q_len
+        if historical_len > 0:
+            hk = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
+            hv = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
+            for t in range(historical_len):
+                blk = int(block_tables[seq_idx, t // block_size].item())
+                off = t % block_size
+                k_expected[blk, :, off] = hk[t]
+                v_expected[blk, :, off] = hv[t]
+                hist_slots.append(blk * block_size + off)
+            hist_k.append(hk)
+            hist_v.append(hv)
+        for t in range(historical_len, kv_len):
+            blk = int(block_tables[seq_idx, t // block_size].item())
+            off = t % block_size
+            k_expected[blk, :, off] = key[q_offset + t - historical_len]
+            v_expected[blk, :, off] = value[q_offset + t - historical_len]
+            slot_mapping_list.append(blk * block_size + off)
+        q_offset += q_len
+    slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int64)
+    attn_metadata.block_table = block_tables
+    attn_metadata.slot_mapping = slot_mapping
+
+    if hist_slots:
+        _write(attn_impl, kv_cache, convert(torch.cat(hist_k), cache_device),
+               convert(torch.cat(hist_v), cache_device),
+               torch.tensor(hist_slots, dtype=torch.int64), cache_device)
+
+    key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
+    _write(attn_impl, kv_cache, key_src, value_src, slot_mapping, cache_device)
+
+    output = torch.full((sum(query_lens), num_query_heads, head_size), float("nan"), dtype=dtype)
+    attn_impl.forward(
+        layer=None,
+        query=convert(query, cache_device),
+        key=key_src,
+        value=value_src,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+    output = output.to("cpu")
+
+    assert torch.isfinite(output).all(), "output contains NaN/inf — clamp or scatter broken"
+
+    ref_output = ref_attn(
+        query=query,
+        key_cache=k_expected.permute(0, 2, 1, 3),  # ref_attn expects token-major [B, T, H, D]
+        value_cache=v_expected.permute(0, 2, 1, 3),
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        block_size=block_size,
+        scale=scale,
+        sliding_window=None,
+        soft_cap=None,
+        alibi_slopes=None,
+    )
+
+    assert_close_outliers(output, ref_output, max_outliers=5, atol=0.2, rtol=0.2,
+                          outlier_atol=0.4, outlier_rtol=0.4)
+
+    del k_pages, v_pages, kv_cache, output
+    gc.collect()
+    vllm_config_mock.speculative_config = None

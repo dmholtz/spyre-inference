@@ -2805,3 +2805,347 @@ def test_sliding_window_is_left_unpadded(default_vllm_config):
         [(7, 300)], block_size=64, sliding_window=128, max_num_blocks=_num_blocks_buckets()[-1]
     )
     assert metadata.padded_num_blocks is None
+
+
+# ---------------------------------------------------------------------------
+# Non-uniform spec-decode verify_len: some decode seqs have query_len=1
+# (no draft tokens this step) while others carry the full verify_len=1+k.
+# ---------------------------------------------------------------------------
+
+
+def _build_spec_decode_metadata(
+    verify_seqs: list[tuple[int, int]],
+    plain_decode_seqs: list[tuple[int, int]],
+    block_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype = torch.float16,
+):
+    """Build SpyreAttentionMetadata for a mixed spec-decode batch.
+
+    ``verify_seqs`` are sequences currently undergoing speculative verification
+    (query_len = 1+k, done prefilling, is_prefilling=False).
+    ``plain_decode_seqs`` are sequences that had their draft fully rejected and
+    receive only a single decode token this step (query_len=1, is_prefilling=False).
+
+    Both lists hold (query_len, kv_len) tuples and are ordered decode-first so
+    the batched path sees them before the reorder.
+    """
+    from unittest.mock import Mock
+
+    from vllm.config import get_current_vllm_config
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        SpyreAttentionMetadataBuilder,
+    )
+
+    # All decode seqs come first (verify then plain), matching what
+    # reorder_batch_to_split_decodes_and_prefills would produce.
+    all_seqs = verify_seqs + plain_decode_seqs
+    query_lens = [q for q, _ in all_seqs]
+    kv_lens = [k for _, k in all_seqs]
+    num_seqs = len(all_seqs)
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+    vllm_config.cache_config.block_size = block_size
+
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["layers.0.self_attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+
+    buckets = SpyreAttnBucketer(vllm_config).num_blocks_buckets
+    max_num_blocks_per_seq = max((k + block_size - 1) // block_size for k in kv_lens)
+    padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
+    if padded_width is not None:
+        max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
+    block_table = torch.randint(0, 256, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32)
+
+    cu_query = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+    slot_mapping = torch.zeros(sum(query_lens), dtype=torch.int64)
+
+    # is_prefilling=False for ALL seqs: they are done prefilling; the multi-token
+    # query is speculative verification, not a prefill chunk.
+    is_prefilling = torch.zeros(num_seqs, dtype=torch.bool)
+
+    common = CommonAttentionMetadata(
+        query_start_loc=cu_query,
+        query_start_loc_cpu=cu_query,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        num_reqs=num_seqs,
+        num_actual_tokens=int(cu_query[-1].item()),
+        max_query_len=max(query_lens),
+        max_seq_len=max(kv_lens),
+        block_table_tensor=block_table,
+        slot_mapping=slot_mapping,
+        causal=True,
+        is_prefilling=is_prefilling,
+    )
+    return builder.build(common_prefix_len=0, common_attn_metadata=common), block_table
+
+
+@pytest.mark.parametrize(
+    "verify_seqs,plain_decode_seqs",
+    [
+        pytest.param(
+            [(3, 256), (3, 512), (3, 128), (3, 384)],
+            [],
+            id="uniform_verify(N=4,vl=3)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 512), (3, 384)],
+            [(1, 128)],
+            id="nonuniform_verify3_plain1(N=4)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 384)],
+            [(1, 512), (1, 128)],
+            id="nonuniform_verify3_plain2(N=4)",
+        ),
+        pytest.param(
+            [(3, 256)],
+            [(1, 512), (1, 128), (1, 384)],
+            id="nonuniform_verify3_plain3(N=4)",
+        ),
+    ],
+)
+def test_spec_decode_nonuniform_builder_metadata(
+    default_vllm_config, monkeypatch, verify_seqs, plain_decode_seqs
+):
+    """Builder produces valid metadata for mixed spec-verify + plain-decode batches.
+
+    Checks:
+    - padded_num_seqs is set (batched path activated)
+    - verify_len = max(query_len across all decode seqs) = 3
+    - decode_query_lens_cpu carries one entry per decode seq
+    - rep_row_ids_cpu has no out-of-range indices
+    - mask padding rows (real_len..verify_len-1) are all -inf
+    - mask real rows (0..real_len-1) are not all -inf
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    # Give the bucketer a spec config so verify_len=3 gets its own seq bucket.
+    vllm_config_mock = __import__("vllm.config", fromlist=["get_current_vllm_config"]).get_current_vllm_config()
+    spec_cfg = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+    spec_cfg.num_speculative_tokens = 2  # verify_len = 1+2 = 3
+    spec_cfg.parallel_drafting = False
+    vllm_config_mock.speculative_config = spec_cfg
+
+    torch.set_default_device("cpu")
+    block_size = 64
+
+    md, _ = _build_spec_decode_metadata(
+        verify_seqs=verify_seqs,
+        plain_decode_seqs=plain_decode_seqs,
+        block_size=block_size,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_size=64,
+    )
+
+    num_decode_seqs = len(verify_seqs) + len(plain_decode_seqs)
+    expected_verify_len = max(q for q, _ in verify_seqs) if verify_seqs else 1
+
+    assert md.padded_num_seqs is not None, "batched path declined this batch"
+    assert md.mask_by_chunk_cpu is not None
+    assert md.rep_row_ids_cpu is not None
+    assert md.decode_query_lens_cpu is not None
+
+    # verify_len is the mask's query-token axis
+    verify_len = md.mask_by_chunk_cpu.shape[-2]
+    assert verify_len == expected_verify_len, (
+        f"verify_len={verify_len}, expected {expected_verify_len}"
+    )
+
+    # decode_query_lens_cpu has exactly one entry per decode seq
+    assert md.decode_query_lens_cpu.shape[0] == num_decode_seqs
+
+    # rep_row_ids_cpu must not reference a row beyond num_decode_tokens
+    total_tokens = int(md.num_decode_tokens)
+    assert md.rep_row_ids_cpu.max().item() < total_tokens, (
+        "rep_row_ids references a row outside the query buffer"
+    )
+
+    # mask_by_chunk shape: [padded_batch_blocks, b_seqs, kv_extent, verify_len, block_size]
+    mask = md.mask_by_chunk_cpu
+    b_seqs = md.padded_num_seqs
+    block_size_mask = mask.shape[-1]
+    mask_min = torch.finfo(torch.float16).min
+
+    # Un-transpose to [b_seqs, padded_batch_blocks, kv_extent, verify_len, block_size]
+    mask_seq_major = mask.permute(1, 0, 2, 3, 4)
+
+    all_decode_seqs = verify_seqs + plain_decode_seqs
+    for s, (q_len, _) in enumerate(all_decode_seqs):
+        # Real rows must have at least one non-inf entry in the first block
+        real_row = mask_seq_major[s, 0, 0, 0]  # [block_size]
+        assert (real_row > mask_min).any(), (
+            f"seq {s} real row 0 is fully masked (all -inf)"
+        )
+        # Padding rows must be all -inf
+        for t in range(q_len, verify_len):
+            pad_row = mask_seq_major[s, 0, 0, t]
+            assert torch.all(pad_row <= mask_min), (
+                f"seq {s} padding row {t} is not fully masked"
+            )
+
+    vllm_config_mock.speculative_config = None
+
+
+@pytest.mark.parametrize(
+    "verify_seqs,plain_decode_seqs",
+    [
+        pytest.param(
+            [(3, 256), (3, 512), (3, 128), (3, 384)],
+            [],
+            id="uniform_verify(N=4,vl=3)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 512), (3, 384)],
+            [(1, 128)],
+            id="nonuniform_verify3_plain1(N=4)",
+        ),
+        pytest.param(
+            [(3, 256), (3, 384)],
+            [(1, 512), (1, 128)],
+            id="nonuniform_verify3_plain2(N=4)",
+        ),
+        pytest.param(
+            [(3, 256)],
+            [(1, 512), (1, 128), (1, 384)],
+            id="nonuniform_verify3_plain3(N=4)",
+        ),
+    ],
+)
+def test_spec_decode_nonuniform_dispatch_correctness(
+    default_vllm_config, enable_batched_decode, monkeypatch, verify_seqs, plain_decode_seqs
+):
+    """Batched kernel output matches the per-seq reference for non-uniform verify_len.
+
+    This is the key regression test for the padding fix: without the clamp and the
+    per-seq scatter, either NaN propagates from the padding rows or the scatter writes
+    the wrong rows into output.
+    """
+    from vllm.config import get_current_vllm_config
+
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+
+    vllm_config_mock = get_current_vllm_config()
+    spec_cfg = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+    spec_cfg.num_speculative_tokens = 2  # verify_len = 1+2 = 3
+    spec_cfg.parallel_drafting = False
+    vllm_config_mock.speculative_config = spec_cfg
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    block_size = 64
+    num_query_heads, num_kv_heads, head_size = 8, 2, 64
+
+    all_seqs = verify_seqs + plain_decode_seqs
+    query_lens = [q for q, _ in all_seqs]
+    kv_lens = [k for _, k in all_seqs]
+    num_seqs = len(all_seqs)
+    dtype = torch.float16
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+
+    num_blocks = 256
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+
+    # Build the metadata first so we get the block table it generated; the cache
+    # population below must use the same table so the mask and the reads agree.
+    attn_metadata, block_tables = _build_spec_decode_metadata(
+        verify_seqs=verify_seqs,
+        plain_decode_seqs=plain_decode_seqs,
+        block_size=block_size,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+
+    # Populate the KV cache: historical tokens + new query tokens
+    slot_mapping_list: list[int] = []
+    q_offset = 0
+    for seq_idx in range(num_seqs):
+        q_len = query_lens[seq_idx]
+        kv_len = kv_lens[seq_idx]
+        historical_len = kv_len - q_len
+        if historical_len > 0:
+            hk = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
+            hv = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
+            for t in range(historical_len):
+                blk = int(block_tables[seq_idx, t // block_size].item())
+                off = t % block_size
+                k_pages_cpu[blk, off] = hk[t]
+                v_pages_cpu[blk, off] = hv[t]
+        for t in range(historical_len, kv_len):
+            blk = int(block_tables[seq_idx, t // block_size].item())
+            off = t % block_size
+            k_pages_cpu[blk, off] = key[q_offset + t - historical_len]
+            v_pages_cpu[blk, off] = value[q_offset + t - historical_len]
+            slot_mapping_list.append(blk * block_size + off)
+        q_offset += q_len
+    slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int64)
+    attn_metadata.slot_mapping = slot_mapping
+
+    impl = SpyreAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+    )
+
+    output = torch.full((sum(query_lens), num_query_heads, head_size), float("nan"), dtype=dtype)
+    kv_cache = SpyrePagedKVCache(k_pages=k_pages_cpu, v_pages=v_pages_cpu)
+    key_src, value_src = _fused_qkv_kv_views(query, key, value, torch.device("cpu"))
+    impl.do_kv_cache_update(None, key_src, value_src, kv_cache, convert(slot_mapping, torch.device("cpu")))
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key_src,
+        value=value_src,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    assert torch.isfinite(output).all(), "output contains NaN/inf — clamp or scatter is broken"
+
+    from spyre_testing_plugin.attn_helpers import assert_close_outliers, ref_attn
+
+    ref_output = ref_attn(
+        query=query,
+        key_cache=k_pages_cpu,
+        value_cache=v_pages_cpu,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        block_size=block_size,
+        scale=scale,
+        sliding_window=None,
+        soft_cap=None,
+        alibi_slopes=None,
+    )
+
+    assert_close_outliers(output, ref_output, max_outliers=5, atol=0.2, rtol=0.2,
+                          outlier_atol=0.4, outlier_rtol=0.4)
+
+    vllm_config_mock.speculative_config = None

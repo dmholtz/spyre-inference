@@ -699,7 +699,7 @@ class TestRecordBatchedDecode:
 
         bucketer = builder._attn_bucketer = make_bucketer()
         keys = {
-            (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
+            (v.num_seqs, v.blocks_per_chunk, v.num_chunks, v.verify_len)
             for v in bucketer.batched_decode_variants()
         }
 
@@ -715,9 +715,11 @@ class TestRecordBatchedDecode:
                 )
                 assert metadata.padded_num_seqs is not None, "builder declined the batched path"
                 assert metadata.chunk_page_ids_cpu is not None
+                assert metadata.mask_by_chunk_cpu is not None
                 key = (
                     metadata.padded_num_seqs,
                     metadata.blocks_per_chunk,
                     metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
+                    metadata.mask_by_chunk_cpu.shape[-2],  # verify_len
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
