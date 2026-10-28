@@ -1823,6 +1823,62 @@ class TorchSpyreModelRunner(GPUModelRunner):
         assert isinstance(model, nn.Module)
         return model
 
+    def propose_draft_token_ids(
+        self,
+        scheduler_output: Any,
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: Any,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        spec_decode_metadata: Any,
+        common_attn_metadata: Any,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+    ) -> list[list[int]] | torch.Tensor:
+        """Propose draft token IDs, padding with sentinel dummy tokens to uniform length.
+
+        Padding drafts to exactly ``num_spec_tokens`` ensures that all decode sequences
+        in the batch share a constant ``verify_len = 1 + num_spec_tokens``. This avoids
+        the non-uniform attention scatter path and dynamic D2D recompilations.
+        """
+        draft_token_ids = super().propose_draft_token_ids(
+            scheduler_output,
+            sampled_token_ids,
+            sampling_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            spec_decode_metadata,
+            common_attn_metadata,
+            slot_mappings,
+        )
+        if not self.num_spec_tokens:
+            return draft_token_ids
+
+        k = self.num_spec_tokens
+        pad_id = getattr(self.model_config, "pad_token_id", None) or 0
+        if isinstance(draft_token_ids, list):
+            padded: list[list[int]] = []
+            for ids in draft_token_ids:
+                if len(ids) < k:
+                    padded.append(ids + [pad_id] * (k - len(ids)))
+                else:
+                    padded.append(ids[:k])
+            return padded
+        elif torch.is_tensor(draft_token_ids):
+            if draft_token_ids.shape[1] < k:
+                pad_tensor = torch.full(
+                    (draft_token_ids.shape[0], k - draft_token_ids.shape[1]),
+                    pad_id,
+                    dtype=draft_token_ids.dtype,
+                    device=draft_token_ids.device,
+                )
+                draft_token_ids = torch.cat([draft_token_ids, pad_tensor], dim=1)
+            elif draft_token_ids.shape[1] > k:
+                draft_token_ids = draft_token_ids[:, :k]
+            return draft_token_ids
+        return draft_token_ids
+
     # --- Buffer management ---
 
     def _make_buffer(

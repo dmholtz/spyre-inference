@@ -887,17 +887,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             decode_threshold=self.reorder_batch_threshold or 1,
             treat_short_extends_as_decodes=common_attn_metadata.is_prefilling is None,
         )
-        # verify_len: maximum query width across all decode seqs (1 for standard decode,
-        # 1+k for speculative verification). Short seqs are padded up to this width inside
-        # the kernel; the mask zeroes their padding slots so they contribute nothing.
+        # verify_len: query width across all decode seqs (1 for standard decode,
+        # 1+k for speculative verification). With draft padding, verify_len is constant
+        # across all decode sequences in the batch.
         if num_decode_seqs > 0:
-            decode_query_lens = (
-                query_start_loc[1 : num_decode_seqs + 1]
-                - query_start_loc[:num_decode_seqs]
-            ).to(dtype=torch.int32, device="cpu")
-            verify_len = int(decode_query_lens.max().item())
+            verify_len = int((query_start_loc[1] - query_start_loc[0]).item())
         else:
-            decode_query_lens = None
             verify_len = 1
         padded_num_seqs = None
         padded_batch_blocks = None
@@ -926,27 +921,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
-                # For verify_len > 1 each sequence occupies verify_len consecutive rows in
-                # the kernel's query gather. Build a flat ID list padded to b_seqs*verify_len.
-                # Short seqs (real_len < verify_len) repeat their last real row in the padding
-                # slots; the mask keeps those slots at -inf so they contribute nothing.
-                assert decode_query_lens is not None
+                # Build a flat ID list padded to b_seqs*verify_len. Since verify_len is
+                # uniform, real query rows 0..num_decode_seqs*verify_len are contiguous.
                 row_ids_flat = torch.zeros(b_seqs * verify_len, dtype=torch.int32)
-                for s in range(num_decode_seqs):
-                    start = int(query_start_loc[s].item())
-                    real_len = int(decode_query_lens[s].item())
-                    row_ids_flat[s * verify_len : s * verify_len + real_len] = torch.arange(
-                        start, start + real_len, dtype=torch.int32
-                    )
-                    if real_len < verify_len:
-                        # Repeat the last real row so the kernel gathers a valid vector;
-                        # the all-inf mask row makes its softmax weight ≈ 0.
-                        row_ids_flat[s * verify_len + real_len : (s + 1) * verify_len] = (
-                            start + real_len - 1
-                        )
+                start = int(query_start_loc[0].item())
+                num_real_query_rows = num_decode_seqs * verify_len
+                row_ids_flat[:num_real_query_rows] = torch.arange(
+                    start, start + num_real_query_rows, dtype=torch.int32
+                )
                 # Entry order (j, s, t): block-slot major, then seq, then token within seq.
                 rep_row_ids_cpu = row_ids_flat.repeat(blocks_per_chunk)
-                decode_query_lens_stored = decode_query_lens
 
                 block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
                 bt = block_table[:num_decode_seqs].to(torch.int32)
@@ -977,18 +961,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     float("-inf"),
                     dtype=self.model_dtype,
                 )
-                assert decode_query_lens is not None
                 for s in range(num_decode_seqs):
                     # Under a window n_use spans the padded slots too, so they are
                     # filled from those tiles; correct only because they are finfo.min.
                     n_use = min(blocks_per_seq[s], b_blocks)
                     if n_use:
-                        # attention_mask_stacks[s]: [num_blocks, aligned_query_len, block_size].
-                        # Copy only the real query-row slice for this seq. Padding rows
-                        # (real_len..verify_len-1) stay at the -inf the allocation set.
-                        real_len_s = int(decode_query_lens[s].item())
-                        mask_bs_bb[s, :n_use, :real_len_s] = (
-                            attention_mask_stacks[s][:n_use, :real_len_s]
+                        mask_bs_bb[s, :n_use, :verify_len] = (
+                            attention_mask_stacks[s][:n_use, :verify_len]
                         )
                 # A row past the batch is -inf in every block, so its softmax is NaN and
                 # the in-graph store would publish it. A real row always has a valid
@@ -1751,9 +1730,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Spyre-lowering shapes drive several structural choices here: K/V/q keep
         # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
         # each chunk block-major to avoid an int32 index relayout; and the result
-        # scatter is either a contiguous prefix copy (uniform verify_len, every decode
-        # seq has exactly verify_len real tokens) or a per-seq scatter (some seqs were
-        # padded to verify_len and only their real rows must reach output).
+        # scatter is a contiguous prefix copy (uniform verify_len across all decode seqs).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
         num_decode_seqs = attn_metadata.num_decode_seqs
@@ -1766,24 +1743,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
 
-        # verify_len is authoritative from the mask shape (axis -2); it equals the
-        # max real query_len across decode seqs and is the kernel's compile-time width.
+        # verify_len is authoritative from the mask shape (axis -2); it is the kernel's compile-time width.
         assert attn_metadata.mask_by_chunk_cpu is not None
         verify_len = attn_metadata.mask_by_chunk_cpu.shape[-2]
 
-        # Uniform iff every decode seq contributed exactly verify_len real tokens.
-        # Only then does result_flat[:num_decode_tokens] form a contiguous valid prefix.
-        decode_query_lens = attn_metadata.decode_query_lens_cpu
-        is_uniform = decode_query_lens is None or int(decode_query_lens.min().item()) == verify_len
-
         # The kernel's store writes out[:b_seqs*verify_len] -- its num_seqs parameter
         # receives b_seqs, not the real count -- so the destination needs that many rows
-        # and a plain offset-0 layout. The per-seq scatter path below covers all other
-        # cases, including a query buffer narrower than the seq bucket and non-uniform
-        # batches where padding rows must not be published. Re-checked per call: vLLM
-        # hands out a fresh buffer per layer.
+        # and a plain offset-0 layout. Re-checked per call: vLLM hands out a fresh buffer per layer.
         num_decode_tokens = attn_metadata.num_decode_tokens
-        store_out = is_uniform and (
+        store_out = (
             query_dev.shape[0] >= b_seqs * verify_len
             and output.shape[0] >= b_seqs * verify_len
             and output.dtype == query_dev.dtype
@@ -1806,25 +1774,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if store_out:
             return
 
+        # Uniform verify_len: all decode seqs have verify_len tokens; result_flat rows
+        # 0..num_decode_tokens-1 map directly to output rows 0..num_decode_tokens-1.
         result_flat = result.reshape(b_seqs * verify_len, num_heads, head_size)
-        if is_uniform:
-            # All decode seqs have verify_len real tokens; result_flat rows 0..num_decode_tokens-1
-            # map directly to output rows 0..num_decode_tokens-1. Neither per-row slice-assign
-            # (spyre::copy_from_d2d specialises on (src_off, dst_off) via @compile_once and can
-            # return a stale binary) nor index_copy_ (CPU-fallback segfaults on vLLM output
-            # buffers) is safe here.
-            src_block = result_flat[:num_decode_tokens].clone()
-            output[:num_decode_tokens].copy_(src_block)
-        else:
-            # Non-uniform: seq s contributed decode_query_lens[s] real tokens and was padded to
-            # verify_len in the kernel. Scatter only real rows from each seq's kernel-output slot.
-            assert decode_query_lens is not None
-            out_offset = 0
-            for s in range(num_decode_seqs):
-                real_len = int(decode_query_lens[s].item())
-                src = result_flat[s * verify_len : s * verify_len + real_len].clone()
-                output[out_offset : out_offset + real_len].copy_(src)
-                out_offset += real_len
+        src_block = result_flat[:num_decode_tokens].clone()
+        output[:num_decode_tokens].copy_(src_block)
 
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
