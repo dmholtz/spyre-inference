@@ -316,6 +316,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        verify_len: int = 1,
     ) -> torch.Tensor:
         scale, v_args = self._read_scales()
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
@@ -336,6 +337,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
+                verify_len,
             )
 
     def _run_page_attn(

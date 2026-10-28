@@ -88,12 +88,15 @@ class SpyreAttnBatchedDecodeBucket:
     ``num_chunks`` (derived from the logical block-axis tensor extent).
     ``num_blocks`` is the bucket they were derived from, kept so the recorder can
     skip a bucket that outruns the KV allocation.
+    ``verify_len`` is the number of query tokens per sequence (1 for standard
+    decode, 1+k for speculative verification).
     """
 
     num_seqs: int
     num_blocks: int
     blocks_per_chunk: int
     num_chunks: int
+    verify_len: int = 1
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -182,6 +185,7 @@ class SpyreAttnBucketer:
     """
 
     def __init__(self, vllm_config: VllmConfig) -> None:
+        self._vllm_config = vllm_config
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
@@ -334,23 +338,33 @@ class SpyreAttnBucketer:
     def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
-        The full ``num_seqs_buckets x num_blocks_buckets`` grid: unlike
-        ``variants()`` there is no inter-axis bound to exploit, since a decode
-        batch of any size can sit at any context length. Both axes are geometric,
-        so the grid stays small.
+        The full ``num_seqs_buckets x num_blocks_buckets x verify_len`` grid:
+        unlike ``variants()`` there is no inter-axis bound to exploit, since a
+        decode batch of any size can sit at any context length. All axes are
+        geometric, so the grid stays small.
+
+        ``verify_len`` covers 1 (standard decode) and ``max_decode_query_len``
+        (speculative verification) when speculative decoding is configured. Without
+        spec decoding only verify_len=1 is emitted.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
+        # Emit one grid per verify_len: 1 for standard decode, plus 1+k for
+        # speculative verification when a speculative config is present.
+        max_vl = max_decode_query_len(self._vllm_config)
+        verify_lens = sorted({1, max_vl}) if max_vl > 1 else [1]
         out: list[SpyreAttnBatchedDecodeBucket] = []
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
             for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
                 blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-                out.append(
-                    SpyreAttnBatchedDecodeBucket(
-                        num_seqs=num_seqs,
-                        num_blocks=num_blocks,
-                        blocks_per_chunk=blocks_per_chunk,
-                        num_chunks=num_chunks,
+                for vl in verify_lens:
+                    out.append(
+                        SpyreAttnBatchedDecodeBucket(
+                            num_seqs=num_seqs,
+                            num_blocks=num_blocks,
+                            blocks_per_chunk=blocks_per_chunk,
+                            num_chunks=num_chunks,
+                            verify_len=vl,
+                        )
                     )
-                )
         return out

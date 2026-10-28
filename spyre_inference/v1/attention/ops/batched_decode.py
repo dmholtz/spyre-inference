@@ -35,6 +35,7 @@ def batched_decode_kernel(
     head_size,
     logits_soft_cap=0.0,
     out=None,
+    verify_len=1,
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
@@ -45,16 +46,21 @@ def batched_decode_kernel(
 
     k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
     chunk_page_ids: [padded_blocks, num_seqs] int32, row b holding each sequence's
-    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1,
-    block_size], broadcast across the query group in the kernel, and across KV heads
-    too unless the tiled walk materialized that axis. rep_row_ids: [entries] int32,
+    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, verify_len,
+    block_size], one mask row per query token; broadcast across KV heads unless the
+    tiled walk materialized that axis. rep_row_ids: [entries * verify_len] int32,
     every query row repeated once per block slot. ``out`` None returns the result
     instead of storing it.
+    ``verify_len`` is 1 for standard decode, 1+k for speculative verification; it
+    merges with the GQA group size so q_total = num_queries_per_kv * verify_len.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    # q_total combines the GQA group axis with the per-sequence verification width.
+    # For verify_len == 1 this is identical to the previous num_queries_per_kv layout.
+    q_total = num_queries_per_kv * verify_len
     q = query.index_select(0, rep_row_ids).reshape(
-        entries, num_kv_heads, num_queries_per_kv, head_size
+        entries, num_kv_heads, q_total, head_size
     )
 
     def reduce_chunk(probs, v_page):
@@ -62,9 +68,9 @@ def batched_decode_kernel(
         chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
         chunk_out = torch.sum(
             torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                probs.reshape(entries, num_kv_heads, q_total, block_size),
                 v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, q_total, head_size),
             dim=0,
             keepdim=True,
         )
@@ -97,7 +103,7 @@ def batched_decode_kernel(
         # Leading-axis split only: merging a permuted axis pair is what torch-spyre
         # rejects, and the mask's advancing read window must stay unflattened.
         sc = scores.reshape(
-            blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
+            blocks_per_chunk, num_seqs, num_kv_heads, q_total, block_size
         )
         sc = sc + mask_rows
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
@@ -122,7 +128,7 @@ def batched_decode_kernel(
             tile_output * rescale + chunk_out,
         ), None
 
-    state_shape = (1, num_seqs, num_kv_heads, num_queries_per_kv, 1)
+    state_shape = (1, num_seqs, num_kv_heads, q_total, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
     (_, tile_sum, tile_output), _ = walk_tiles(
         chunk_body,
@@ -133,15 +139,15 @@ def batched_decode_kernel(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),
             torch.zeros(
-                (1, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+                (1, num_seqs, num_kv_heads, q_total, head_size),
                 **state_kwargs,
             ),
         ),
     )
-    attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+    attn = (tile_output / tile_sum).reshape(num_seqs * verify_len, num_heads, head_size)
     if out is not None:
         # The destination prefix starts at offset 0, so torch-spyre#3770 does not
         # apply; rows past the batch are don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
+        out[: num_seqs * verify_len].copy_(attn)
         return out
     return attn
