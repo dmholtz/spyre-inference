@@ -423,7 +423,10 @@ def _spyre_sample_recovered_tokens_kernel_impl(
             tok_idx = start + pos
             if NO_DRAFT_PROBS:
                 residual = tp[tok_idx].clone()
-                residual[draft_ids[tok_idx]] = 0.0
+                # A padded draft (-1) proposed nothing to exclude; indexing with it
+                # would zero the last vocab entry instead.
+                if draft_ids[tok_idx] >= 0:
+                    residual[draft_ids[tok_idx]] = 0.0
             else:
                 residual = torch.clamp(tp[tok_idx] - dp[tok_idx], min=0.0)  # type: ignore[index]
             scores = residual * iq[req_idx]

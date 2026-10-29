@@ -30,6 +30,18 @@ from spyre_inference.v1.sample.rejection_sampler import (
 from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _kernel_overrides():
+    """Install the PyTorch rejection kernels, as WorkerBase does at worker init.
+
+    Without Triton the stock kernels are undecorated functions that vLLM's launch
+    wrapper cannot bind, so the sampler fails before reaching any Spyre code.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    TorchSpyrePlatform.register_triton_kernel_overrides()
+
+
 def _make_sampling_metadata(
     batch_size: int,
     all_greedy: bool = True,
@@ -189,3 +201,122 @@ def test_spyre_rejection_sampler_forward_no_exponential_calls():
         if has_sampling_kernels():
             # Crucial assertion: aten::exponential_ was NEVER invoked!
             mock_exp.assert_not_called()
+
+
+# Padded drafts: TorchSpyreScheduler pads every draft list to k with -1, which the
+# rejection sampler must always reject without disturbing the real drafts before it.
+
+PAD = -1
+
+
+def test_greedy_kernel_rejects_padded_draft():
+    from spyre_inference.v1.worker.spyre_model_runner import (
+        _spyre_rejection_greedy_sample_kernel_impl,
+    )
+
+    out = torch.full((1, 4), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    _spyre_rejection_greedy_sample_kernel_impl(
+        output_token_ids_ptr=out,
+        cu_num_draft_tokens_ptr=torch.tensor([3]),
+        draft_token_ids_ptr=torch.tensor([10, PAD, PAD]),
+        target_argmax_ptr=torch.tensor([10, 20, 30]),
+        bonus_token_ids_ptr=torch.tensor([40]),
+        is_greedy_ptr=None,
+        max_spec_len=3,
+    )
+    # The real draft is accepted; the first pad is replaced by the target's own token,
+    # which is what the bonus slot would have held without padding.
+    assert out.tolist() == [[10, 20, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]]
+
+
+def test_random_kernel_rejects_padded_draft_even_at_zero_uniform():
+    from spyre_inference.v1.worker.spyre_model_runner import (
+        _spyre_rejection_random_sample_kernel_impl,
+    )
+
+    vocab = 8
+    out = torch.full((1, 3), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    _spyre_rejection_random_sample_kernel_impl(
+        output_token_ids_ptr=out,
+        cu_num_draft_tokens_ptr=torch.tensor([2]),
+        draft_token_ids_ptr=torch.tensor([3, PAD]),
+        draft_probs_ptr=None,
+        target_probs_ptr=torch.full((2, vocab), 1.0 / vocab),
+        bonus_token_ids_ptr=torch.tensor([7]),
+        recovered_token_ids_ptr=torch.tensor([0, 5]),
+        # 0.0 accepts any real draft: only the pad check can reject position 1.
+        uniform_probs_ptr=torch.zeros(2, dtype=torch.float64),
+        is_greedy_ptr=torch.tensor([False]),
+        max_spec_len=2,
+        vocab_size=vocab,
+        NO_DRAFT_PROBS=True,
+    )
+    assert out.tolist() == [[3, 5, PLACEHOLDER_TOKEN_ID]]
+
+
+def test_recovered_fallback_keeps_last_vocab_id_for_padded_draft():
+    """A pad proposed nothing, so the residual is the whole target distribution."""
+    from spyre_inference.v1.worker.spyre_model_runner import (
+        _spyre_sample_recovered_tokens_kernel_impl,
+    )
+
+    vocab = 8
+    target = torch.full((1, vocab), 0.01)
+    target[0, vocab - 1] = 0.93  # the last id, which indexing with -1 would hit
+    out = torch.empty(1, dtype=torch.int64)
+    _spyre_sample_recovered_tokens_kernel_impl(
+        output_token_ids_ptr=out,
+        cu_num_draft_tokens_ptr=torch.tensor([1]),
+        draft_token_ids_ptr=torch.tensor([PAD]),
+        draft_probs_ptr=None,
+        target_probs_ptr=target,
+        inv_q_ptr=torch.ones(1, vocab),
+        vocab_size=vocab,
+        NO_DRAFT_PROBS=True,
+    )
+    assert out.item() == vocab - 1
+
+
+def test_recovered_fallback_still_excludes_a_real_draft():
+    from spyre_inference.v1.worker.spyre_model_runner import (
+        _spyre_sample_recovered_tokens_kernel_impl,
+    )
+
+    vocab = 8
+    target = torch.full((1, vocab), 0.01)
+    target[0, 2] = 0.9
+    target[0, 6] = 0.03
+    out = torch.empty(1, dtype=torch.int64)
+    _spyre_sample_recovered_tokens_kernel_impl(
+        output_token_ids_ptr=out,
+        cu_num_draft_tokens_ptr=torch.tensor([1]),
+        draft_token_ids_ptr=torch.tensor([2]),
+        draft_probs_ptr=None,
+        target_probs_ptr=target,
+        inv_q_ptr=torch.ones(1, vocab),
+        vocab_size=vocab,
+        NO_DRAFT_PROBS=True,
+    )
+    assert out.item() == 6
+
+
+def test_greedy_rejection_sample_padded_verification():
+    """Two requests at k=3: one fully drafted, one with a single real draft."""
+    target_logits = torch.full((6, 100), -10.0)
+    for row, tok in enumerate([10, 20, 30, 11, 21, 31]):
+        target_logits[row, tok] = 10.0
+
+    out = spyre_rejection_sample(
+        draft_token_ids=torch.tensor([10, 20, 30, 11, PAD, PAD]),
+        num_draft_tokens=[3, 3],
+        max_spec_len=3,
+        cu_num_draft_tokens=torch.tensor([3, 6], dtype=torch.int32),
+        draft_probs=None,
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([40, 41]),
+        sampling_metadata=_make_sampling_metadata(batch_size=2, all_greedy=True),
+    )
+    assert out.tolist() == [
+        [10, 20, 30, 40],
+        [11, 21, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+    ]
