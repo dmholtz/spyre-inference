@@ -980,11 +980,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     torch.arange(num_decode_seqs + 1, dtype=torch.int32) * decode_query_len,
                 )
                 # Groups scatter one row per sequence, so verification keeps one rectangle.
-                if (
-                    envs.SPYRE_JAGGED_DECODE
-                    and decode_query_len == 1
-                    and decode_uniformity < 1.0
-                ):
+                if envs.SPYRE_JAGGED_DECODE and decode_query_len == 1 and decode_uniformity < 1.0:
                     decode_groups = self._batched_decode_groups(
                         decode_blocks,
                         blocks_per_seq,

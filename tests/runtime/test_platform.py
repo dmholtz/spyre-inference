@@ -847,6 +847,8 @@ def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, siz
 
     assert vllm_config.scheduler_config.max_num_batched_tokens == budget
     assert vllm_config.compilation_config.compile_sizes[-len(sizes) :] == sizes
+
+
 def _speculative_defaults_config(num_speculative_tokens: int, max_num_seqs: int) -> VllmConfig:
     from vllm.config import SpeculativeConfig
 

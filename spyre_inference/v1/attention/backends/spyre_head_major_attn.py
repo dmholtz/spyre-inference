@@ -109,9 +109,7 @@ def _lx_max_cores(output_units: int) -> int:
     return 0 if output_units >= _SPYRE_CORES else _LX_ATTN_CORES
 
 
-def _run_with_capped_cores(
-    output_units: int, fn: Callable[..., _T], *args, **kwargs
-) -> _T:
+def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], *args, **kwargs) -> _T:
     # work_division reads config.sencores per compile, which is what keeps the rest of
     # the model uncapped.
     max_cores = _lx_max_cores(output_units)

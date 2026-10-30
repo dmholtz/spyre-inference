@@ -227,9 +227,7 @@ class SpyreRejectionSampler(RejectionSampler):
         target_logits = raw_target_logits
         if not self.is_processed_logprobs_mode:
             target_logits = target_logits.clone()
-        target_logits = self.apply_logits_processors(
-            target_logits, sampling_metadata, metadata
-        )
+        target_logits = self.apply_logits_processors(target_logits, sampling_metadata, metadata)
         target_logits = apply_sampling_constraints(
             target_logits,
             metadata.cu_num_draft_tokens,
