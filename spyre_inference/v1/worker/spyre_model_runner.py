@@ -88,9 +88,9 @@ from spyre_inference.v1.pool.encoder_grid import (
     unpad_encoder_grid,
 )
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
-from spyre_inference.v1.sample.rejection_sampler import SpyreRejectionSampler
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+from spyre_inference.v1.spec_decode import rejection_sampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import (
     block_sharing_defeated_by,
@@ -586,11 +586,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self.sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]
         if self.speculative_config is not None:
-            self.rejection_sampler = SpyreRejectionSampler(
-                self.sampler,
-                spec_config=self.speculative_config,
-                device=self.device,
-            )
+            rejection_sampler.install()
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre

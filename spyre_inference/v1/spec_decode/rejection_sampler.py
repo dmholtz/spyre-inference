@@ -19,11 +19,16 @@
 
 Adapted from vllm/utils/cpu_triton_utils.py at 5df63a7203. The native kernels
 accept the caller's dtypes directly and implement synthetic acceptance.
+
+``install`` additionally swaps upstream's recovered-token sampling for one that draws
+its noise in-kernel; the rest of vLLM's RejectionSampler runs unchanged.
 """
 
 import torch
+from vllm.v1.sample import rejection_sampler as upstream
+from vllm.v1.sample.metadata import SamplingMetadata
 
-from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
+from spyre_inference.v1.sample.sampling_kernels import draw_seeds, has_sampling_kernels
 
 _HAS_REJECTION_KERNELS = has_sampling_kernels() and all(
     hasattr(torch.ops._spyre_C, name)
@@ -32,6 +37,7 @@ _HAS_REJECTION_KERNELS = has_sampling_kernels() and all(
         "rejection_random_sample_kernel_impl",
         "expand_kernel_impl",
         "sample_recovered_tokens_kernel_impl",
+        "sample_recovered_tokens_seeded_kernel_impl",
     )
 )
 
@@ -131,3 +137,56 @@ def recover(
         vocab_size,
         NO_DRAFT_PROBS,
     )
+
+
+_upstream_sample_recovered_tokens = upstream.sample_recovered_tokens
+
+
+def sample_recovered_tokens(
+    max_spec_len: int,
+    num_draft_tokens: list[int],
+    cu_num_draft_tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    target_probs: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    device: torch.device,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Upstream's ``sample_recovered_tokens`` without its [batch, vocab] exponential_ draw."""
+    if use_fp64_gumbel:
+        # The kernel's noise is fixed; keep upstream's fp64 q, as SpyreTopKTopPSampler does.
+        return _upstream_sample_recovered_tokens(
+            max_spec_len,
+            num_draft_tokens,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            sampling_metadata,
+            device,
+            use_fp64_gumbel,
+        )
+    # Like upstream, a request without drafts leaves its generator untouched.
+    generators = {
+        i: generator
+        for i, generator in sampling_metadata.generators.items()
+        if num_draft_tokens[i] > 0
+    }
+    recovered_token_ids = torch.empty_like(draft_token_ids)
+    _kernels().sample_recovered_tokens_seeded_kernel_impl(
+        recovered_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        draw_seeds(len(num_draft_tokens), generators),
+        target_probs.shape[-1],
+        draft_probs is None,
+    )
+    return recovered_token_ids
+
+
+def install() -> None:
+    """Route upstream ``rejection_sample`` through ``sample_recovered_tokens`` above."""
+    upstream.sample_recovered_tokens = sample_recovered_tokens  # ty: ignore[invalid-assignment]
