@@ -262,11 +262,11 @@ def test_random_rejection_with_zero_draft_probability():
     assert output.tolist() == [[0, -1]]
 
 
-@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize("spyre", [False, True])
 @pytest.mark.parametrize("with_draft_probs", [False, True])
-def test_random_rejection_preserves_target_distribution(with_draft_probs, seeded, monkeypatch):
-    if seeded:
-        monkeypatch.setattr(upstream, "sample_recovered_tokens", native.sample_recovered_tokens)
+def test_random_rejection_preserves_target_distribution(with_draft_probs, spyre, monkeypatch):
+    if spyre:
+        monkeypatch.setattr(upstream, "rejection_sample", native.rejection_sample)
     torch.manual_seed(129)
     n = 12000
     p = torch.tensor([0.1, 0.3, 0.6])
@@ -496,10 +496,64 @@ def test_fp64_gumbel_keeps_upstream_recovery(monkeypatch):
     assert len(calls) == 1
 
 
-def test_install_routes_upstream_recovery(monkeypatch):
-    monkeypatch.setattr(upstream, "sample_recovered_tokens", upstream.sample_recovered_tokens)
+def test_install_routes_upstream_rejection_sample(monkeypatch):
+    monkeypatch.setattr(upstream, "rejection_sample", upstream.rejection_sample)
     native.install()
-    assert upstream.sample_recovered_tokens is native.sample_recovered_tokens
+    assert upstream.rejection_sample is native.rejection_sample
+
+
+def _greedy_and_random_batch():
+    """Request 0 greedy, request 1 random; three draft positions each."""
+    torch.manual_seed(5)
+    return dict(
+        draft_token_ids=torch.tensor([3, 1, 4, 1, 5, 9]),
+        num_draft_tokens=[3, 3],
+        max_spec_len=3,
+        cu_num_draft_tokens=torch.tensor([3, 6]),
+        draft_probs=None,
+        target_logits=torch.randn(6, 16),
+        bonus_token_ids=torch.tensor([[7], [8]]),
+    )
+
+
+@pytest.mark.parametrize("all_greedy", [True, False])
+def test_rejection_sample_takes_the_target_argmax_with_greedy_argmax(all_greedy, monkeypatch):
+    from spyre_inference.v1.sample import sampler
+
+    calls = []
+    greedy_argmax = sampler.greedy_sample
+    monkeypatch.setattr(
+        sampler, "greedy_sample", lambda logits: calls.append(logits.shape) or greedy_argmax(logits)
+    )
+    batch = _greedy_and_random_batch()
+    metadata = SimpleNamespace(
+        all_greedy=all_greedy,
+        all_random=False,
+        temperature=torch.tensor([0.0, 0.0 if all_greedy else 1.0]),
+        generators={},
+    )
+    result = native.rejection_sample(**batch, sampling_metadata=metadata)
+    expected = upstream.rejection_sample(**batch, sampling_metadata=metadata)
+    assert calls == [(6, 16)]
+    # Greedy rows are deterministic, so they match upstream exactly.
+    assert result[0].tolist() == expected[0].tolist()
+    if all_greedy:
+        assert result.tolist() == expected.tolist()
+
+
+def test_rejection_sample_with_no_draft_tokens():
+    metadata = SimpleNamespace(all_greedy=True, all_random=False)
+    result = native.rejection_sample(
+        torch.empty(0, dtype=torch.int64),
+        [0, 0],
+        2,
+        torch.tensor([0, 0]),
+        None,
+        torch.empty(0, 16),
+        torch.tensor([[7], [8]]),
+        metadata,
+    )
+    assert result.tolist() == [[7, -1, -1], [8, -1, -1]]
 
 
 # Padded drafts: TorchSpyreScheduler pads every draft list to k with -1, which the
@@ -555,7 +609,7 @@ def test_greedy_rejection_sample_padded_verification():
     target_logits = torch.full((6, 100), -10.0)
     for row, token in enumerate([10, 20, 30, 11, 21, 31]):
         target_logits[row, token] = 10.0
-    result = upstream.rejection_sample(
+    result = native.rejection_sample(
         torch.tensor([10, 20, 30, 11, PAD, PAD]),
         [3, 3],
         3,
