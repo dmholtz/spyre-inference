@@ -158,6 +158,9 @@ CMAKE_ARGS = "--fresh"
 VLLM_REQUIRE_RUST_FRONTEND = "1"
 # The fork commit is not a release tag; keep the version inside the vllm>=0.33.0,<0.34 pin.
 VLLM_VERSION_OVERRIDE = "0.33.0+rustpooling"
+# Link vllm-rs against the system OpenSSL (openssl-devel) instead of building the
+# vendored copy, whose Configure needs perl modules the build images lack.
+OPENSSL_NO_VENDOR = "1"
 
 # Make the Power/Z source build report the same version and torch pin as the
 # vendored metadata below.
