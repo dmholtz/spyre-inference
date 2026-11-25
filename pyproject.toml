@@ -154,6 +154,10 @@ constraint-dependencies = [
 [tool.uv.extra-build-variables.vllm]
 VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
+# Fail the build instead of silently skipping the optional vllm-rs (Rust frontend) binary.
+VLLM_REQUIRE_RUST_FRONTEND = "1"
+# The fork commit is not a release tag; keep the version inside the vllm>=0.33.0,<0.34 pin.
+VLLM_VERSION_OVERRIDE = "0.33.0+rustpooling"
 
 # Make the Power/Z source build report the same version and torch pin as the
 # vendored metadata below.
@@ -172,7 +176,8 @@ SPYRE_RPM_BUNDLE = "main_snap_2026_11_11_09"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
+  # rust-pooling-embeddings: v0.33.0 + Rust frontend pooling/embeddings support.
+  { git = "https://github.com/dmholtz/vllm", rev = "5be3109d1ec140a9feebbb8c284963ec75d9b9b5" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "0d212328a12cce9a35a28b1df7e50f82f06fda41" }
 torch = [
