@@ -180,7 +180,7 @@ SPYRE_RPM_BUNDLE = "main_snap_2026_11_11_09"
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   # rust-pooling-embeddings: v0.33.0 + Rust frontend pooling/embeddings support.
-  { git = "https://github.com/dmholtz/vllm", rev = "73df7fbada4e4315ccf7df8bc7ea624b0f9c48ce" },
+  { git = "https://github.com/dmholtz/vllm", rev = "ba918a8753e6f141068d8b20550da66766ee6132" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "0d212328a12cce9a35a28b1df7e50f82f06fda41" }
 torch = [
