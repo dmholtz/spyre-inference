@@ -5745,7 +5745,7 @@ requires-dist = [
     { name = "torchvision", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'", specifier = "==0.29.1", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'", git = "https://github.com/pytorch/vision?tag=v0.29.1" },
     { name = "transformers", specifier = "<5.17" },
-    { name = "vllm", extras = ["grpc"], git = "https://github.com/dmholtz/vllm?rev=ba918a8753e6f141068d8b20550da66766ee6132" },
+    { name = "vllm", extras = ["grpc"], git = "https://github.com/dmholtz/vllm?rev=4ef08ba76833a8247d88e05644442e4e7f7cfffb" },
 ]
 
 [package.metadata.requires-dev]
@@ -6456,7 +6456,7 @@ wheels = [
 [[package]]
 name = "vllm"
 version = "0.33.0+rustpooling"
-source = { git = "https://github.com/dmholtz/vllm?rev=ba918a8753e6f141068d8b20550da66766ee6132#ba918a8753e6f141068d8b20550da66766ee6132" }
+source = { git = "https://github.com/dmholtz/vllm?rev=4ef08ba76833a8247d88e05644442e4e7f7cfffb#4ef08ba76833a8247d88e05644442e4e7f7cfffb" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
